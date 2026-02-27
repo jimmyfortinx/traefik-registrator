@@ -257,7 +257,7 @@ func TestSyncOnceRegistersThenDeregisters(t *testing.T) {
 	cfg.consulHTTPAddr = consulSrv.URL
 
 	managed := map[string]struct{}{}
-	if err := syncOnce(ctx, cfg, dockerHTTP, consulHTTP, managed); err != nil {
+	if err := syncDockerModeOnce(ctx, cfg, dockerHTTP, consulHTTP, managed); err != nil {
 		t.Fatalf("first sync failed: %v", err)
 	}
 	if _, ok := managed["docker-0123456789ab"]; !ok {
@@ -268,7 +268,7 @@ func TestSyncOnceRegistersThenDeregisters(t *testing.T) {
 	containers = nil
 	containersMu.Unlock()
 
-	if err := syncOnce(ctx, cfg, dockerHTTP, consulHTTP, managed); err != nil {
+	if err := syncDockerModeOnce(ctx, cfg, dockerHTTP, consulHTTP, managed); err != nil {
 		t.Fatalf("second sync failed: %v", err)
 	}
 	if len(managed) != 0 {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net"
@@ -12,17 +13,23 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
+	"gopkg.in/yaml.v3"
 )
 
 type config struct {
 	consulHTTPAddr       string
 	consulToken          string
+	sourceMode           string
 	dockerSocket         string
+	fileSourcePath       string
 	resyncInterval       time.Duration
 	requireTraefikEnable bool
 	ownerID              string
@@ -94,7 +101,25 @@ type consulCatalogServiceInstance struct {
 	ServiceMeta map[string]string `json:"ServiceMeta"`
 }
 
+type fileSourceDocument struct {
+	Services map[string]fileServiceDefinition `json:"services" yaml:"services"`
+}
+
+type fileServiceDefinition struct {
+	ID      string            `json:"id" yaml:"id"`
+	Name    string            `json:"name" yaml:"name"`
+	Address string            `json:"address" yaml:"address"`
+	Port    int               `json:"port" yaml:"port"`
+	Tags    []string          `json:"tags" yaml:"tags"`
+	Meta    map[string]string `json:"meta" yaml:"meta"`
+	Key     string            `json:"-" yaml:"-"`
+}
+
 const (
+	sourceModeDocker       = "docker"
+	sourceModeFile         = "file"
+	fileExtYAML            = ".yaml"
+	fileExtYML             = ".yml"
 	managedByMetaKey       = "managed-by"
 	managedByMetaValue     = "traefik-registrator"
 	ownerIDMetaKey         = "owner-id"
@@ -109,22 +134,53 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	dockerHTTP := newDockerHTTPClient(cfg.dockerSocket)
-	dockerEventsHTTP := newDockerEventsHTTPClient(cfg.dockerSocket)
 	consulHTTP := &http.Client{Timeout: 10 * time.Second}
 
 	log.Printf(
-		"starting event loop: consul=%s docker_socket=%s resync_interval=%s gc_interval=%s require_traefik_enable=%t owner_id=%s",
+		"starting event loop: source_mode=%s consul=%s resync_interval=%s gc_interval=%s require_traefik_enable=%t owner_id=%s",
+		cfg.sourceMode,
 		cfg.consulHTTPAddr,
-		cfg.dockerSocket,
 		cfg.resyncInterval,
 		cfg.gcInterval,
 		cfg.requireTraefikEnable,
 		cfg.ownerID,
 	)
+	if cfg.sourceMode == sourceModeDocker {
+		log.Printf("docker mode configured: docker_socket=%s", cfg.dockerSocket)
+	} else {
+		log.Printf(
+			"file mode configured: file_source_path=%s",
+			cfg.fileSourcePath,
+		)
+	}
 
 	managed := map[string]struct{}{}
-	if err := syncOnce(ctx, cfg, dockerHTTP, consulHTTP, managed); err != nil {
+	gcSeen := map[string]time.Time{}
+
+	var syncSource func(context.Context) error
+	var dockerEvents <-chan dockerEvent
+	var fileEvents <-chan struct{}
+
+	switch cfg.sourceMode {
+	case sourceModeDocker:
+		dockerHTTP := newDockerHTTPClient(cfg.dockerSocket)
+		dockerEventsHTTP := newDockerEventsHTTPClient(cfg.dockerSocket)
+		syncSource = func(ctx context.Context) error {
+			return syncDockerModeOnce(ctx, cfg, dockerHTTP, consulHTTP, managed)
+		}
+		events := make(chan dockerEvent, 64)
+		dockerEvents = events
+		go streamDockerEvents(ctx, dockerEventsHTTP, events)
+	case sourceModeFile:
+		syncSource = func(ctx context.Context) error {
+			return syncFileModeOnce(ctx, cfg, consulHTTP, managed)
+		}
+		events := make(chan struct{}, 1)
+		fileEvents = events
+		go streamFileSourceChanges(ctx, cfg, events)
+	}
+
+	if err := syncSource(ctx); err != nil {
 		log.Printf("initial sync failed: %v", err)
 	}
 
@@ -142,22 +198,24 @@ func main() {
 	defer ownerTicker.Stop()
 	gcTicker := time.NewTicker(cfg.gcInterval)
 	defer gcTicker.Stop()
-	events := make(chan dockerEvent, 64)
-	gcSeen := map[string]time.Time{}
-	go streamDockerEvents(ctx, dockerEventsHTTP, events)
 
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("shutdown signal received; leaving current Consul registrations unchanged")
 			return
-		case ev := <-events:
+		case ev := <-dockerEvents:
 			log.Printf("docker event: type=%s action=%s -> sync", ev.Type, ev.Action)
-			if err := syncOnce(ctx, cfg, dockerHTTP, consulHTTP, managed); err != nil {
+			if err := syncSource(ctx); err != nil {
 				log.Printf("sync after event failed: %v", err)
 			}
+		case <-fileEvents:
+			log.Printf("file source change detected -> sync")
+			if err := syncSource(ctx); err != nil {
+				log.Printf("sync after file change failed: %v", err)
+			}
 		case <-ticker.C:
-			if err := syncOnce(ctx, cfg, dockerHTTP, consulHTTP, managed); err != nil {
+			if err := syncSource(ctx); err != nil {
 				log.Printf("periodic resync failed: %v", err)
 			}
 		case <-ownerTicker.C:
@@ -175,6 +233,21 @@ func main() {
 func validateConfig(cfg config) {
 	if cfg.ownerID == "" {
 		log.Fatal("OWNER_ID resolved to empty value")
+	}
+	switch cfg.sourceMode {
+	case sourceModeDocker:
+		if strings.TrimSpace(cfg.dockerSocket) == "" {
+			log.Fatal("DOCKER_SOCKET cannot be empty when SOURCE_MODE=docker")
+		}
+	case sourceModeFile:
+		if strings.TrimSpace(cfg.fileSourcePath) == "" {
+			log.Fatal("FILE_SOURCE_PATH cannot be empty when SOURCE_MODE=file")
+		}
+		if info, err := os.Stat(cfg.fileSourcePath); err == nil && !info.IsDir() && !isSupportedFileSourcePath(cfg.fileSourcePath) {
+			log.Fatal("FILE_SOURCE_PATH must point to a .yaml/.yml file or directory containing .yaml/.yml files")
+		}
+	default:
+		log.Fatalf("invalid SOURCE_MODE: %q (expected %q or %q)", cfg.sourceMode, sourceModeDocker, sourceModeFile)
 	}
 	if cfg.ownerHeartbeatPass >= cfg.ownerHeartbeatTTL {
 		log.Fatalf(
@@ -253,7 +326,7 @@ func readDockerEvents(ctx context.Context, dockerHTTP *http.Client, out chan<- d
 	}
 }
 
-func syncOnce(
+func syncDockerModeOnce(
 	ctx context.Context,
 	cfg config,
 	dockerHTTP *http.Client,
@@ -274,6 +347,37 @@ func syncOnce(
 		desired[reg.ID] = reg
 	}
 
+	return applyDesiredState(ctx, cfg, consulHTTP, managed, desired, fmt.Sprintf("running_containers=%d", len(containers)))
+}
+
+func syncFileModeOnce(
+	ctx context.Context,
+	cfg config,
+	consulHTTP *http.Client,
+	managed map[string]struct{},
+) error {
+	desired, configured, err := loadFileModeDesiredServices(cfg)
+	if err != nil {
+		return fmt.Errorf("load file source: %w", err)
+	}
+	return applyDesiredState(
+		ctx,
+		cfg,
+		consulHTTP,
+		managed,
+		desired,
+		fmt.Sprintf("configured_services=%d source_path=%s", configured, cfg.fileSourcePath),
+	)
+}
+
+func applyDesiredState(
+	ctx context.Context,
+	cfg config,
+	consulHTTP *http.Client,
+	managed map[string]struct{},
+	desired map[string]consulServiceRegistration,
+	sourceSummary string,
+) error {
 	for _, reg := range desired {
 		if err := registerService(ctx, cfg, consulHTTP, reg); err != nil {
 			log.Printf("register %s failed: %v", reg.ID, err)
@@ -293,8 +397,347 @@ func syncOnce(
 		delete(managed, id)
 	}
 
-	log.Printf("sync complete: running_containers=%d registered_services=%d", len(containers), len(desired))
+	log.Printf("sync complete: %s registered_services=%d", sourceSummary, len(desired))
 	return nil
+}
+
+func streamFileSourceChanges(ctx context.Context, cfg config, out chan<- struct{}) {
+	backoff := time.Second
+	for {
+		err := watchFileSourceChanges(ctx, cfg, out)
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+
+		log.Printf("file events stream disconnected: %v (retry in %s)", err, backoff)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff < 15*time.Second {
+			backoff *= 2
+			if backoff > 15*time.Second {
+				backoff = 15 * time.Second
+			}
+		}
+	}
+}
+
+func watchFileSourceChanges(ctx context.Context, cfg config, out chan<- struct{}) error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+	defer watcher.Close()
+
+	targets, err := collectFileWatchTargets(cfg.fileSourcePath)
+	if err != nil {
+		return err
+	}
+	for _, target := range targets {
+		if err := watcher.Add(target); err != nil {
+			return fmt.Errorf("watch %s: %w", target, err)
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return io.EOF
+			}
+			if err != nil {
+				return err
+			}
+		case ev, ok := <-watcher.Events:
+			if !ok {
+				return io.EOF
+			}
+			if !isFileSourceEventRelevant(cfg.fileSourcePath, ev.Name) {
+				continue
+			}
+			log.Printf("file source event: op=%s path=%s", fileWatchOpString(ev.Op), ev.Name)
+			select {
+			case out <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
+func loadFileModeDesiredServices(cfg config) (map[string]consulServiceRegistration, int, error) {
+	files, err := collectFileSourcePaths(cfg.fileSourcePath)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	desired := map[string]consulServiceRegistration{}
+	configured := 0
+
+	for _, filePath := range files {
+		services, err := parseFileServiceDefinitions(filePath)
+		if err != nil {
+			return nil, 0, fmt.Errorf("%s: %w", filePath, err)
+		}
+		for idx, svc := range services {
+			reg, err := buildFileRegistration(cfg, svc, filePath)
+			if err != nil {
+				return nil, 0, fmt.Errorf("%s service[%d]: %w", filePath, idx, err)
+			}
+			if _, exists := desired[reg.ID]; exists {
+				return nil, 0, fmt.Errorf("%s service[%d]: duplicate service id %q", filePath, idx, reg.ID)
+			}
+			desired[reg.ID] = reg
+			configured++
+		}
+	}
+
+	return desired, configured, nil
+}
+
+func collectFileWatchTargets(sourcePath string) ([]string, error) {
+	sourcePath = filepath.Clean(sourcePath)
+	info, err := os.Stat(sourcePath)
+	if err == nil && info.IsDir() {
+		parent := filepath.Dir(sourcePath)
+		if parent == sourcePath {
+			return []string{sourcePath}, nil
+		}
+		return []string{sourcePath, parent}, nil
+	}
+	if err == nil {
+		return []string{filepath.Dir(sourcePath)}, nil
+	}
+	if os.IsNotExist(err) {
+		return []string{filepath.Dir(sourcePath)}, nil
+	}
+	return nil, err
+}
+
+func isFileSourceEventRelevant(sourcePath, eventPath string) bool {
+	sourcePath = filepath.Clean(sourcePath)
+	eventPath = filepath.Clean(eventPath)
+	if sourcePath == eventPath {
+		return true
+	}
+
+	info, err := os.Stat(sourcePath)
+	if err == nil && info.IsDir() {
+		return filepath.Dir(eventPath) == sourcePath && isSupportedFileSourcePath(eventPath)
+	}
+	if err == nil {
+		return eventPath == sourcePath
+	}
+	if os.IsNotExist(err) {
+		return eventPath == sourcePath ||
+			(filepath.Dir(eventPath) == sourcePath && isSupportedFileSourcePath(eventPath))
+	}
+	return false
+}
+
+func fileWatchOpString(op fsnotify.Op) string {
+	parts := make([]string, 0, 5)
+	if op&fsnotify.Create != 0 {
+		parts = append(parts, "CREATE")
+	}
+	if op&fsnotify.Write != 0 {
+		parts = append(parts, "WRITE")
+	}
+	if op&fsnotify.Remove != 0 {
+		parts = append(parts, "REMOVE")
+	}
+	if op&fsnotify.Rename != 0 {
+		parts = append(parts, "RENAME")
+	}
+	if op&fsnotify.Chmod != 0 {
+		parts = append(parts, "CHMOD")
+	}
+	if len(parts) == 0 {
+		return "UNKNOWN"
+	}
+	return strings.Join(parts, "|")
+}
+
+func collectFileSourcePaths(sourcePath string) ([]string, error) {
+	info, err := os.Stat(sourcePath)
+	if err != nil {
+		return nil, err
+	}
+
+	if !info.IsDir() {
+		if !isSupportedFileSourcePath(sourcePath) {
+			return nil, fmt.Errorf("unsupported FILE_SOURCE_PATH extension for %q: only .yaml/.yml are supported", sourcePath)
+		}
+		return []string{sourcePath}, nil
+	}
+
+	entries, err := os.ReadDir(sourcePath)
+	if err != nil {
+		return nil, err
+	}
+
+	files := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(sourcePath, entry.Name())
+		if !isSupportedFileSourcePath(path) {
+			continue
+		}
+		files = append(files, path)
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+func parseFileServiceDefinitions(filePath string) ([]fileServiceDefinition, error) {
+	if !isSupportedFileSourcePath(filePath) {
+		return nil, fmt.Errorf("unsupported file extension: only .yaml/.yml are supported")
+	}
+
+	raw, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	if strings.TrimSpace(string(raw)) == "" {
+		return nil, nil
+	}
+
+	var doc fileSourceDocument
+	if err := yaml.Unmarshal(raw, &doc); err == nil && doc.Services != nil {
+		keys := make([]string, 0, len(doc.Services))
+		for key := range doc.Services {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+
+		services := make([]fileServiceDefinition, 0, len(keys))
+		for _, key := range keys {
+			svc := doc.Services[key]
+			svc.Key = strings.TrimSpace(key)
+			if svc.Key != "" && strings.TrimSpace(svc.Name) == "" {
+				svc.Name = svc.Key
+			}
+			services = append(services, svc)
+		}
+		return services, nil
+	}
+
+	return nil, fmt.Errorf("expected YAML object with \"services\" keyed map")
+}
+
+func isSupportedFileSourcePath(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == fileExtYAML || ext == fileExtYML
+}
+
+func buildFileRegistration(
+	cfg config,
+	svc fileServiceDefinition,
+	sourceFile string,
+) (consulServiceRegistration, error) {
+	address := strings.TrimSpace(svc.Address)
+	if address == "" {
+		return consulServiceRegistration{}, fmt.Errorf("address is required")
+	}
+	if svc.Port <= 0 {
+		return consulServiceRegistration{}, fmt.Errorf("port must be > 0")
+	}
+
+	id := strings.TrimSpace(svc.ID)
+	if id == "" {
+		keyID := normalizeFileServiceKey(svc.Key)
+		if keyID != "" {
+			id = cfg.serviceIDPrefix + keyID
+		} else {
+			id = deriveFileServiceID(cfg, sourceFile, svc)
+		}
+	}
+
+	name := strings.TrimSpace(svc.Name)
+	if name == "" {
+		name = cfg.defaultServiceName
+	}
+
+	meta := map[string]string{}
+	for key, value := range svc.Meta {
+		k := strings.TrimSpace(key)
+		if k == "" {
+			continue
+		}
+		meta[k] = value
+	}
+	meta[managedByMetaKey] = managedByMetaValue
+	if cfg.ownerID != "" {
+		meta[ownerIDMetaKey] = cfg.ownerID
+	}
+	meta["source"] = sourceModeFile
+	meta["source-file"] = filepath.Base(sourceFile)
+
+	tags := make([]string, 0, len(svc.Tags))
+	for _, tag := range svc.Tags {
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			continue
+		}
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+
+	return consulServiceRegistration{
+		ID:      id,
+		Name:    name,
+		Address: address,
+		Port:    svc.Port,
+		Tags:    tags,
+		Meta:    meta,
+	}, nil
+}
+
+func normalizeFileServiceKey(raw string) string {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" {
+		return ""
+	}
+
+	var b strings.Builder
+	lastDash := false
+	for _, r := range raw {
+		isAllowed := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.'
+		if isAllowed {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func deriveFileServiceID(cfg config, sourceFile string, svc fileServiceDefinition) string {
+	tags := append([]string(nil), svc.Tags...)
+	sort.Strings(tags)
+	seed := strings.Join(
+		[]string{
+			sourceFile,
+			strings.TrimSpace(svc.Name),
+			strings.TrimSpace(svc.Address),
+			strconv.Itoa(svc.Port),
+			strings.Join(tags, ","),
+		},
+		"|",
+	)
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(seed))
+	return cfg.serviceIDPrefix + "file-" + strconv.FormatUint(h.Sum64(), 16)
 }
 
 func listRunningContainers(ctx context.Context, dockerHTTP *http.Client) ([]dockerContainer, error) {
@@ -793,7 +1236,9 @@ func loadConfig() config {
 	return config{
 		consulHTTPAddr:       getEnv("CONSUL_HTTP_ADDR", "http://127.0.0.1:8500"),
 		consulToken:          os.Getenv("CONSUL_HTTP_TOKEN"),
+		sourceMode:           strings.ToLower(getEnv("SOURCE_MODE", sourceModeDocker)),
 		dockerSocket:         getEnv("DOCKER_SOCKET", "/var/run/docker.sock"),
+		fileSourcePath:       getEnv("FILE_SOURCE_PATH", "/etc/traefik-registrator/services.d"),
 		resyncInterval:       mustParseDurationEnv("POLL_INTERVAL", "5m"),
 		requireTraefikEnable: isTruthy(getEnv("REQUIRE_TRAEFIK_ENABLE", "true")),
 		ownerID:              defaultOwnerID(),

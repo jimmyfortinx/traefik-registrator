@@ -1,0 +1,7 @@
+services:
+  whoami:
+    address: whoami-file
+    port: 80
+    tags:
+      - traefik.enable=true
+      - traefik.http.routers.whoami-file.rule=Host(`whoami-file.local`)
