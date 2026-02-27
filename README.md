@@ -9,8 +9,15 @@ It listens to Docker container events, registers/deregisters services in Consul,
 - Registers one Consul service per running container.
 - Watches Docker events (`start`, `stop`, `die`, `destroy`) and syncs immediately.
 - Runs a periodic full resync as a safety fallback.
+- Registers a heartbeat service per registrator owner (`traefik-registrator-owner`).
+- Periodically sweeps stale registrations cluster-wide:
+  - removes services with missing `owner-id` after `ORPHAN_GRACE_PERIOD`
+  - removes services whose owner heartbeat is not passing after `OWNER_DOWN_GRACE_PERIOD`
 - By default, only containers with `traefik.enable=true` are registered.
 - Service ID: `<SERVICE_ID_PREFIX><container-id-12chars>`.
+- Service metadata:
+  - `managed-by=traefik-registrator`
+  - `owner-id=<OWNER_ID or hostname fallback>`
 - Service name selection order:
   - `SERVICE_NAME_LABEL` (default: `com.docker.compose.service`)
   - `com.docker.compose.service`
@@ -33,6 +40,12 @@ It listens to Docker container events, registers/deregisters services in Consul,
 - `DOCKER_SOCKET` (default: `/var/run/docker.sock`)
 - `POLL_INTERVAL` (default: `5m`, periodic full-resync interval)
 - `REQUIRE_TRAEFIK_ENABLE` (default: `true`)
+- `OWNER_ID` (optional, recommended: stable per-server ID; fallback: hostname)
+- `OWNER_HEARTBEAT_TTL` (default: `30s`)
+- `OWNER_HEARTBEAT_PASS_INTERVAL` (default: `10s`, must be lower than TTL)
+- `GC_INTERVAL` (default: `1m`)
+- `ORPHAN_GRACE_PERIOD` (default: `10m`)
+- `OWNER_DOWN_GRACE_PERIOD` (default: `10m`)
 - `SERVICE_ID_PREFIX` (default: `docker-`)
 - `SERVICE_NAME_LABEL` (default: `com.docker.compose.service`)
 - `SERVICE_PORT_LABEL` (default: `consul.port`)
@@ -52,6 +65,9 @@ docker run -d \
   --name traefik-registrator \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e CONSUL_HTTP_ADDR=http://consul.service.consul:8500 \
+  -e OWNER_ID=server-a \
+  -e ORPHAN_GRACE_PERIOD=10m \
+  -e OWNER_DOWN_GRACE_PERIOD=10m \
   -e SERVICE_ID_PREFIX=docker- \
   --restart unless-stopped \
   traefik-registrator:local
