@@ -1,0 +1,10 @@
+services:
+  app-https:
+    address: app.internal
+    port: 443
+    tags:
+      - traefik.enable=true
+      - traefik.http.routers.app-https.rule=Host(`app.example.com`)
+      - traefik.http.routers.app-https.tls=true
+      - traefik.http.services.app-https.loadbalancer.server.scheme=https
+      - traefik.http.services.app-https.loadbalancer.server.port=443
