@@ -1,0 +1,12 @@
+api:
+  insecure: true
+
+entryPoints:
+  web:
+    address: ":80"
+
+providers:
+  consulCatalog:
+    endpoint:
+      address: consul:8500
+    exposedByDefault: false
