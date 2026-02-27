@@ -14,7 +14,7 @@ In `file` mode, it reads service definitions from a file or directory and keeps 
 - Registers a heartbeat service per registrator owner (`traefik-registrator-owner`).
 - Periodically sweeps stale registrations cluster-wide:
   - removes services with missing `owner-id` after `ORPHAN_GRACE_PERIOD`
-  - removes services whose owner heartbeat is not passing after `OWNER_DOWN_GRACE_PERIOD`
+  - removes services whose owner heartbeat is not passing on that Consul node after `OWNER_DOWN_GRACE_PERIOD`
 - In `docker` mode:
   - Watches Docker events (`start`, `stop`, `die`, `destroy`) and syncs immediately.
   - By default, only containers with `traefik.enable=true` are registered.

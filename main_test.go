@@ -500,6 +500,97 @@ func TestSweepStaleServicesRemovesDeadOwnersAndOrphans(t *testing.T) {
 	}
 }
 
+func TestSweepStaleServicesRemovesStaleNodeForLiveOwner(t *testing.T) {
+	ctx := context.Background()
+	cfg := defaultTestConfig()
+	cfg.ownerDownGrace = 5 * time.Millisecond
+
+	type deregisterPayload struct {
+		Node      string `json:"Node"`
+		ServiceID string `json:"ServiceID"`
+	}
+
+	var (
+		mu         sync.Mutex
+		deregister []deregisterPayload
+	)
+
+	consulSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/health/checks/" + ownerHeartbeatService:
+			_ = json.NewEncoder(w).Encode([]consulHealthCheck{{
+				Node:      "node-new",
+				Status:    "passing",
+				ServiceID: ownerHeartbeatIDPrefix + "owner-a",
+			}})
+			return
+		case "/v1/catalog/services":
+			_ = json.NewEncoder(w).Encode(map[string][]string{
+				"web": {},
+			})
+			return
+		case "/v1/catalog/service/web":
+			_ = json.NewEncoder(w).Encode([]consulCatalogServiceInstance{
+				{
+					Node:        "node-new",
+					ServiceID:   "web-live",
+					ServiceName: "web",
+					ServiceMeta: map[string]string{managedByMetaKey: managedByMetaValue, ownerIDMetaKey: "owner-a"},
+				},
+				{
+					Node:        "node-old",
+					ServiceID:   "web-stale",
+					ServiceName: "web",
+					ServiceMeta: map[string]string{managedByMetaKey: managedByMetaValue, ownerIDMetaKey: "owner-a"},
+				},
+			})
+			return
+		case "/v1/catalog/deregister":
+			var payload deregisterPayload
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			deregister = append(deregister, payload)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		default:
+			http.NotFound(w, r)
+			return
+		}
+	}))
+	defer consulSrv.Close()
+
+	cfg.consulHTTPAddr = consulSrv.URL
+	seen := map[string]time.Time{}
+
+	if err := sweepStaleServices(ctx, cfg, consulSrv.Client(), seen); err != nil {
+		t.Fatalf("first sweep failed: %v", err)
+	}
+	mu.Lock()
+	if len(deregister) != 0 {
+		mu.Unlock()
+		t.Fatalf("expected no immediate deregistration, got %#v", deregister)
+	}
+	mu.Unlock()
+
+	time.Sleep(15 * time.Millisecond)
+	if err := sweepStaleServices(ctx, cfg, consulSrv.Client(), seen); err != nil {
+		t.Fatalf("second sweep failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(deregister) != 1 {
+		t.Fatalf("expected 1 deregistration, got %#v", deregister)
+	}
+	if deregister[0].Node != "node-old" || deregister[0].ServiceID != "web-stale" {
+		t.Fatalf("unexpected deregistration payload: %#v", deregister[0])
+	}
+}
+
 func TestTraefikTagsSorted(t *testing.T) {
 	labels := map[string]string{
 		"traefik.http.routers.b.rule": "Host(`b.local`)",
