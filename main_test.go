@@ -285,6 +285,109 @@ func TestSyncOnceRegistersThenDeregisters(t *testing.T) {
 	}
 }
 
+func TestApplyDesiredStateRecoversStaleServicesAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	cfg := defaultTestConfig()
+
+	desired := map[string]consulServiceRegistration{
+		"docker-live": {
+			ID:      "docker-live",
+			Name:    "live",
+			Address: "10.10.0.2",
+			Port:    8080,
+			Meta: map[string]string{
+				managedByMetaKey: managedByMetaValue,
+				ownerIDMetaKey:   "owner-a",
+			},
+		},
+	}
+
+	var (
+		mu            sync.Mutex
+		deregistered  []string
+		agentServices = map[string]consulAgentService{
+			"docker-old": {
+				ID: "docker-old",
+				Meta: map[string]string{
+					managedByMetaKey: managedByMetaValue,
+					ownerIDMetaKey:   "owner-a",
+				},
+			},
+			"docker-other-owner": {
+				ID: "docker-other-owner",
+				Meta: map[string]string{
+					managedByMetaKey: managedByMetaValue,
+					ownerIDMetaKey:   "owner-b",
+				},
+			},
+			"traefik-registrator-owner-owner-a": {
+				ID: "traefik-registrator-owner-owner-a",
+				Meta: map[string]string{
+					managedByMetaKey: managedByMetaValue,
+					ownerIDMetaKey:   "owner-a",
+					"kind":           "owner-heartbeat",
+				},
+			},
+		}
+	)
+
+	consulSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/agent/service/register":
+			var reg consulServiceRegistration
+			if err := json.NewDecoder(r.Body).Decode(&reg); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			agentServices[reg.ID] = consulAgentService{
+				ID:   reg.ID,
+				Meta: reg.Meta,
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/agent/services":
+			mu.Lock()
+			defer mu.Unlock()
+			_ = json.NewEncoder(w).Encode(agentServices)
+			return
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/agent/service/deregister/"):
+			id := strings.TrimPrefix(r.URL.Path, "/v1/agent/service/deregister/")
+			id, _ = url.PathUnescape(id)
+			mu.Lock()
+			deregistered = append(deregistered, id)
+			delete(agentServices, id)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		default:
+			http.NotFound(w, r)
+			return
+		}
+	}))
+	defer consulSrv.Close()
+
+	cfg.consulHTTPAddr = consulSrv.URL
+	managed := map[string]struct{}{}
+	if err := applyDesiredState(ctx, cfg, consulSrv.Client(), managed, desired, "restart-reconcile"); err != nil {
+		t.Fatalf("apply desired state failed: %v", err)
+	}
+
+	sort.Strings(deregistered)
+	wantDeregistered := []string{"docker-old"}
+	if strings.Join(deregistered, ",") != strings.Join(wantDeregistered, ",") {
+		t.Fatalf("unexpected reconciled deregistration: got=%v want=%v", deregistered, wantDeregistered)
+	}
+
+	if _, ok := managed["docker-live"]; !ok {
+		t.Fatalf("expected live service to be tracked as managed")
+	}
+	if _, ok := managed["docker-old"]; ok {
+		t.Fatalf("stale service should not remain tracked as managed")
+	}
+}
+
 func TestSweepStaleServicesRemovesDeadOwnersAndOrphans(t *testing.T) {
 	ctx := context.Background()
 	cfg := defaultTestConfig()

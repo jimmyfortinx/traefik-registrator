@@ -101,6 +101,11 @@ type consulCatalogServiceInstance struct {
 	ServiceMeta map[string]string `json:"ServiceMeta"`
 }
 
+type consulAgentService struct {
+	ID   string            `json:"ID"`
+	Meta map[string]string `json:"Meta"`
+}
+
 type fileSourceDocument struct {
 	Services map[string]fileServiceDefinition `json:"services" yaml:"services"`
 }
@@ -397,7 +402,42 @@ func applyDesiredState(
 		delete(managed, id)
 	}
 
-	log.Printf("sync complete: %s registered_services=%d", sourceSummary, len(desired))
+	recovered := 0
+	agentServices, err := listAgentServices(ctx, cfg, consulHTTP)
+	if err != nil {
+		log.Printf("owner reconciliation skipped: list agent services failed: %v", err)
+	} else {
+		for id, svc := range agentServices {
+			if _, ok := desired[id]; ok {
+				continue
+			}
+
+			meta := svc.Meta
+			if meta == nil || meta[managedByMetaKey] != managedByMetaValue {
+				continue
+			}
+			if strings.TrimSpace(meta["kind"]) == "owner-heartbeat" {
+				continue
+			}
+			if strings.TrimSpace(meta[ownerIDMetaKey]) != cfg.ownerID {
+				continue
+			}
+
+			if err := deregisterService(ctx, cfg, consulHTTP, id); err != nil {
+				log.Printf("reconcile stale %s failed: %v", id, err)
+				continue
+			}
+			delete(managed, id)
+			recovered++
+		}
+	}
+
+	log.Printf(
+		"sync complete: %s registered_services=%d recovered_stale_services=%d",
+		sourceSummary,
+		len(desired),
+		recovered,
+	)
 	return nil
 }
 
@@ -866,6 +906,39 @@ func deregisterService(ctx context.Context, cfg config, consulHTTP *http.Client,
 		return fmt.Errorf("consul API returned %s", resp.Status)
 	}
 	return nil
+}
+
+func listAgentServices(
+	ctx context.Context,
+	cfg config,
+	consulHTTP *http.Client,
+) (map[string]consulAgentService, error) {
+	u := strings.TrimRight(cfg.consulHTTPAddr, "/") + "/v1/agent/services"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.consulToken != "" {
+		req.Header.Set("X-Consul-Token", cfg.consulToken)
+	}
+
+	resp, err := consulHTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("consul API returned %s", resp.Status)
+	}
+
+	var services map[string]consulAgentService
+	if err := json.NewDecoder(resp.Body).Decode(&services); err != nil {
+		return nil, err
+	}
+	if services == nil {
+		return map[string]consulAgentService{}, nil
+	}
+	return services, nil
 }
 
 func registerOwnerHeartbeatService(
