@@ -1,0 +1,127 @@
+services:
+  consul:
+    image: hashicorp/consul:1.20
+    command: agent -dev -client=0.0.0.0
+    healthcheck:
+      test: ["CMD", "consul", "info"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  prepare-file-config:
+    image: busybox:1.37
+    command:
+      - sh
+      - -ec
+      - |
+        mkdir -p /fixtures/services.d
+        cat > /fixtures/services.d/app-https.yml <<'YAML'
+        services:
+          app-https:
+            address: app.internal
+            port: 443
+            tags:
+              - traefik.enable=true
+              - traefik.http.routers.app-https.rule=Host(`app.example.com`)
+              - traefik.http.routers.app-https.tls=true
+              - traefik.http.services.app-https.loadbalancer.server.scheme=https
+              - traefik.http.services.app-https.loadbalancer.server.port=443
+        YAML
+        tail -f /dev/null
+    volumes:
+      - file-routes:/fixtures/services.d
+
+  registrator-file:
+    image: traefik-registrator:test
+    build:
+      context: ../..
+    depends_on:
+      consul:
+        condition: service_healthy
+      prepare-file-config:
+        condition: service_started
+    environment:
+      SOURCE_MODE: file
+      FILE_SOURCE_PATH: /etc/traefik-registrator/services.d
+      CONSUL_HTTP_ADDR: http://consul:8500
+      POLL_INTERVAL: 2s
+      GC_INTERVAL: 2s
+      OWNER_ID: example-https-file
+      ORPHAN_GRACE_PERIOD: 20s
+      OWNER_DOWN_GRACE_PERIOD: 20s
+      SERVICE_ID_PREFIX: file-
+    volumes:
+      - file-routes:/etc/traefik-registrator/services.d:ro
+
+  verify:
+    image: python:3.13-alpine
+    depends_on:
+      consul:
+        condition: service_healthy
+      registrator-file:
+        condition: service_started
+    command:
+      - python
+      - -c
+      - |
+        import json
+        import time
+        import urllib.request
+
+        consul = "http://consul:8500"
+        deadline = time.time() + 90
+        expected_owner = "example-https-file"
+        expected_tags = {
+            "traefik.enable=true",
+            "traefik.http.routers.app-https.rule=Host(`app.example.com`)",
+            "traefik.http.routers.app-https.tls=true",
+            "traefik.http.services.app-https.loadbalancer.server.scheme=https",
+            "traefik.http.services.app-https.loadbalancer.server.port=443",
+        }
+        last_services = None
+
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(consul + "/v1/agent/services", timeout=3) as resp:
+                    last_services = json.load(resp)
+            except Exception:
+                time.sleep(1)
+                continue
+
+            managed = []
+            owner_heartbeat = False
+            for service in last_services.values():
+                meta = service.get("Meta", {})
+                if meta.get("managed-by") != "traefik-registrator":
+                    continue
+                if meta.get("kind") == "owner-heartbeat":
+                    owner_heartbeat = True
+                    continue
+                managed.append(service)
+
+            candidate = None
+            for service in managed:
+                if service.get("Service") == "app-https":
+                    candidate = service
+                    break
+
+            if candidate is not None and owner_heartbeat:
+                tags = set(candidate.get("Tags", []))
+                if (
+                    candidate.get("Address") == "app.internal"
+                    and candidate.get("Port") == 443
+                    and candidate.get("Meta", {}).get("owner-id") == expected_owner
+                    and candidate.get("Meta", {}).get("source") == "file"
+                    and expected_tags.issubset(tags)
+                ):
+                    print("https-only-file scenario passed")
+                    raise SystemExit(0)
+
+            time.sleep(1)
+
+        print("https-only-file scenario failed")
+        print(json.dumps(last_services, indent=2))
+        raise SystemExit(1)
+
+volumes:
+  file-routes:

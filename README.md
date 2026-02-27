@@ -84,6 +84,21 @@ services:
       - traefik.http.routers.whoami-file.rule=Host(`whoami-file.local`)
 ```
 
+HTTPS-only backend example:
+
+```yaml
+services:
+  app-https:
+    address: app.internal
+    port: 443
+    tags:
+      - traefik.enable=true
+      - traefik.http.routers.app-https.rule=Host(`app.example.com`)
+      - traefik.http.routers.app-https.tls=true
+      - traefik.http.services.app-https.loadbalancer.server.scheme=https
+      - traefik.http.services.app-https.loadbalancer.server.port=443
+```
+
 Fields:
 
 - `address` and `port` are required.
@@ -135,6 +150,65 @@ docker run -d \
   --restart unless-stopped \
   traefik-registrator:local
 ```
+
+## Docker Swarm Setup
+
+When running in Swarm, avoid ambiguous Consul endpoints and unstable owner IDs.
+
+Recommended:
+
+- For `deploy.mode: global` registrator, set a stable per-node `OWNER_ID` with a Swarm template.
+- Prefer `tasks.consul-server:8500` over `consul-server:8500` to avoid service VIP load-balancing surprises.
+- Do not share the same `OWNER_ID` across multiple running registrator instances.
+- For a singleton file-mode registrator, set a fixed explicit `OWNER_ID` (for example `file-dokploy`).
+
+Example stack snippet:
+
+```yaml
+services:
+  consul-server:
+    image: hashicorp/consul:1.22.3
+    command: >
+      agent -server -bootstrap-expect=2 -ui
+      -client=0.0.0.0
+      -bind='{{ GetInterfaceIP "eth0" }}'
+      -retry-join=tasks.consul-server
+    endpoint_mode: dnsrr
+    deploy:
+      mode: global
+      placement:
+        constraints:
+          - node.labels.consul.server == true
+
+  registrator:
+    image: ghcr.io/jimmyfortinx/traefik-registrator:latest
+    deploy:
+      mode: global
+    hostname: '{{.Node.Hostname}}'
+    environment:
+      CONSUL_HTTP_ADDR: http://tasks.consul-server:8500
+      OWNER_ID: '{{.Node.Hostname}}'
+      POLL_INTERVAL: 60s
+      GC_INTERVAL: 30s
+      ORPHAN_GRACE_PERIOD: 2m
+      OWNER_DOWN_GRACE_PERIOD: 2m
+      SERVICE_ID_PREFIX: docker-
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  registrator-file:
+    image: ghcr.io/jimmyfortinx/traefik-registrator:latest
+    deploy:
+      replicas: 1
+    environment:
+      SOURCE_MODE: file
+      FILE_SOURCE_PATH: /etc/traefik-registrator/services.d
+      CONSUL_HTTP_ADDR: http://tasks.consul-server:8500
+      OWNER_ID: file-dokploy
+      SERVICE_ID_PREFIX: file-
+```
+
+If you still observe duplicate service registrations on different Consul nodes, point each registrator to a node-local Consul agent (client) instead of a shared/load-balanced endpoint.
 
 ## Local End-to-End Test
 
@@ -227,6 +301,7 @@ docker compose -f tests/docker-compose.test.yml run --rm tests
 All scenario files are in `examples/` and intentionally publish no ports, so multiple worktrees can run them concurrently.
 
 - `examples/basic-registration`: registers a Traefik-enabled service, checks tags/meta, checks owner heartbeat service.
+- `examples/https-only-file`: registers a file-mode service that only exposes HTTPS (`scheme=https`, `port=443`).
 - `examples/traefik-enable-filter`: verifies `REQUIRE_TRAEFIK_ENABLE=true` filtering.
 - `examples/custom-label-overrides`: verifies `SERVICE_*_LABEL` overrides and `REQUIRE_TRAEFIK_ENABLE=false`.
 - `examples/gc-stale-services`: seeds stale catalog entries and verifies GC cleanup for orphan and dead-owner services.
