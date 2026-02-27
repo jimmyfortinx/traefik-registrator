@@ -25,6 +25,12 @@ type config struct {
 	dockerSocket         string
 	resyncInterval       time.Duration
 	requireTraefikEnable bool
+	ownerID              string
+	ownerHeartbeatTTL    time.Duration
+	ownerHeartbeatPass   time.Duration
+	gcInterval           time.Duration
+	orphanGrace          time.Duration
+	ownerDownGrace       time.Duration
 	serviceIDPrefix      string
 	serviceNameLabel     string
 	servicePortLabel     string
@@ -53,11 +59,13 @@ type dockerNetworkEndpoint struct {
 }
 
 type consulServiceRegistration struct {
-	ID      string   `json:"ID"`
-	Name    string   `json:"Name"`
-	Address string   `json:"Address"`
-	Port    int      `json:"Port"`
-	Tags    []string `json:"Tags,omitempty"`
+	ID      string              `json:"ID"`
+	Name    string              `json:"Name"`
+	Address string              `json:"Address,omitempty"`
+	Port    int                 `json:"Port,omitempty"`
+	Tags    []string            `json:"Tags,omitempty"`
+	Meta    map[string]string   `json:"Meta,omitempty"`
+	Check   *consulServiceCheck `json:"Check,omitempty"`
 }
 
 type dockerEvent struct {
@@ -65,8 +73,38 @@ type dockerEvent struct {
 	Action string `json:"Action"`
 }
 
+type consulServiceCheck struct {
+	Name                           string `json:"Name,omitempty"`
+	TTL                            string `json:"TTL,omitempty"`
+	DeregisterCriticalServiceAfter string `json:"DeregisterCriticalServiceAfter,omitempty"`
+}
+
+type consulHealthCheck struct {
+	Node        string `json:"Node"`
+	CheckID     string `json:"CheckID"`
+	Status      string `json:"Status"`
+	ServiceID   string `json:"ServiceID"`
+	ServiceName string `json:"ServiceName"`
+}
+
+type consulCatalogServiceInstance struct {
+	Node        string            `json:"Node"`
+	ServiceID   string            `json:"ServiceID"`
+	ServiceName string            `json:"ServiceName"`
+	ServiceMeta map[string]string `json:"ServiceMeta"`
+}
+
+const (
+	managedByMetaKey       = "managed-by"
+	managedByMetaValue     = "traefik-registrator"
+	ownerIDMetaKey         = "owner-id"
+	ownerHeartbeatService  = "traefik-registrator-owner"
+	ownerHeartbeatIDPrefix = "traefik-registrator-owner-"
+)
+
 func main() {
 	cfg := loadConfig()
+	validateConfig(cfg)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -76,11 +114,13 @@ func main() {
 	consulHTTP := &http.Client{Timeout: 10 * time.Second}
 
 	log.Printf(
-		"starting event loop: consul=%s docker_socket=%s resync_interval=%s require_traefik_enable=%t",
+		"starting event loop: consul=%s docker_socket=%s resync_interval=%s gc_interval=%s require_traefik_enable=%t owner_id=%s",
 		cfg.consulHTTPAddr,
 		cfg.dockerSocket,
 		cfg.resyncInterval,
+		cfg.gcInterval,
 		cfg.requireTraefikEnable,
+		cfg.ownerID,
 	)
 
 	managed := map[string]struct{}{}
@@ -88,9 +128,22 @@ func main() {
 		log.Printf("initial sync failed: %v", err)
 	}
 
+	ownerServiceID := ownerHeartbeatIDPrefix + cfg.ownerID
+	if err := registerOwnerHeartbeatService(ctx, cfg, consulHTTP, ownerServiceID); err != nil {
+		log.Printf("owner heartbeat registration failed: %v", err)
+	}
+	if err := passOwnerHeartbeat(ctx, cfg, consulHTTP, ownerServiceID); err != nil {
+		log.Printf("initial owner heartbeat pass failed: %v", err)
+	}
+
 	ticker := time.NewTicker(cfg.resyncInterval)
 	defer ticker.Stop()
+	ownerTicker := time.NewTicker(cfg.ownerHeartbeatPass)
+	defer ownerTicker.Stop()
+	gcTicker := time.NewTicker(cfg.gcInterval)
+	defer gcTicker.Stop()
 	events := make(chan dockerEvent, 64)
+	gcSeen := map[string]time.Time{}
 	go streamDockerEvents(ctx, dockerEventsHTTP, events)
 
 	for {
@@ -107,7 +160,28 @@ func main() {
 			if err := syncOnce(ctx, cfg, dockerHTTP, consulHTTP, managed); err != nil {
 				log.Printf("periodic resync failed: %v", err)
 			}
+		case <-ownerTicker.C:
+			if err := passOwnerHeartbeat(ctx, cfg, consulHTTP, ownerServiceID); err != nil {
+				log.Printf("owner heartbeat pass failed: %v", err)
+			}
+		case <-gcTicker.C:
+			if err := sweepStaleServices(ctx, cfg, consulHTTP, gcSeen); err != nil {
+				log.Printf("gc sweep failed: %v", err)
+			}
 		}
+	}
+}
+
+func validateConfig(cfg config) {
+	if cfg.ownerID == "" {
+		log.Fatal("OWNER_ID resolved to empty value")
+	}
+	if cfg.ownerHeartbeatPass >= cfg.ownerHeartbeatTTL {
+		log.Fatalf(
+			"OWNER_HEARTBEAT_PASS_INTERVAL (%s) must be smaller than OWNER_HEARTBEAT_TTL (%s)",
+			cfg.ownerHeartbeatPass,
+			cfg.ownerHeartbeatTTL,
+		)
 	}
 }
 
@@ -279,6 +353,12 @@ func buildRegistration(cfg config, c dockerContainer) (consulServiceRegistration
 	name := serviceName(cfg, labels, c.Names, c.ID)
 	id := cfg.serviceIDPrefix + shortID(c.ID)
 	tags := traefikTags(labels)
+	meta := map[string]string{
+		managedByMetaKey: managedByMetaValue,
+	}
+	if cfg.ownerID != "" {
+		meta[ownerIDMetaKey] = cfg.ownerID
+	}
 
 	return consulServiceRegistration{
 		ID:      id,
@@ -286,6 +366,7 @@ func buildRegistration(cfg config, c dockerContainer) (consulServiceRegistration
 		Address: address,
 		Port:    port,
 		Tags:    tags,
+		Meta:    meta,
 	}, true
 }
 
@@ -338,6 +419,283 @@ func deregisterService(ctx context.Context, cfg config, consulHTTP *http.Client,
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("consul API returned %s", resp.Status)
+	}
+	return nil
+}
+
+func registerOwnerHeartbeatService(
+	ctx context.Context,
+	cfg config,
+	consulHTTP *http.Client,
+	serviceID string,
+) error {
+	reg := consulServiceRegistration{
+		ID:   serviceID,
+		Name: ownerHeartbeatService,
+		Meta: map[string]string{
+			managedByMetaKey: managedByMetaValue,
+			ownerIDMetaKey:   cfg.ownerID,
+			"kind":           "owner-heartbeat",
+		},
+		Check: &consulServiceCheck{
+			Name:                           "owner heartbeat",
+			TTL:                            cfg.ownerHeartbeatTTL.String(),
+			DeregisterCriticalServiceAfter: cfg.ownerDownGrace.String(),
+		},
+	}
+	return registerService(ctx, cfg, consulHTTP, reg)
+}
+
+func passOwnerHeartbeat(ctx context.Context, cfg config, consulHTTP *http.Client, serviceID string) error {
+	checkID := "service:" + serviceID
+	u := strings.TrimRight(cfg.consulHTTPAddr, "/") + "/v1/agent/check/pass/" + url.PathEscape(checkID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, nil)
+	if err != nil {
+		return err
+	}
+	if cfg.consulToken != "" {
+		req.Header.Set("X-Consul-Token", cfg.consulToken)
+	}
+
+	resp, err := consulHTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("consul API returned %s", resp.Status)
+	}
+	return nil
+}
+
+func sweepStaleServices(
+	ctx context.Context,
+	cfg config,
+	consulHTTP *http.Client,
+	seen map[string]time.Time,
+) error {
+	aliveOwners, err := listAliveOwners(ctx, cfg, consulHTTP)
+	if err != nil {
+		return err
+	}
+
+	serviceNames, err := listCatalogServiceNames(ctx, cfg, consulHTTP)
+	if err != nil {
+		return err
+	}
+
+	now := time.Now()
+	activeCandidates := map[string]struct{}{}
+	removed := 0
+
+	for _, serviceName := range serviceNames {
+		instances, err := listCatalogServiceInstances(ctx, cfg, consulHTTP, serviceName)
+		if err != nil {
+			log.Printf("gc skip service=%s: list instances failed: %v", serviceName, err)
+			continue
+		}
+
+		for _, inst := range instances {
+			if strings.TrimSpace(inst.ServiceID) == "" || strings.TrimSpace(inst.Node) == "" {
+				continue
+			}
+			if inst.ServiceName == ownerHeartbeatService {
+				continue
+			}
+
+			meta := inst.ServiceMeta
+			if meta == nil || meta[managedByMetaKey] != managedByMetaValue {
+				continue
+			}
+			if strings.TrimSpace(meta["kind"]) == "owner-heartbeat" {
+				continue
+			}
+
+			owner := strings.TrimSpace(meta[ownerIDMetaKey])
+			reason := ""
+			grace := cfg.ownerDownGrace
+			if owner == "" {
+				reason = "missing owner-id"
+				grace = cfg.orphanGrace
+			} else if _, ok := aliveOwners[owner]; !ok {
+				reason = "owner heartbeat missing"
+			} else {
+				continue
+			}
+
+			candidateKey := inst.Node + ":" + inst.ServiceID
+			activeCandidates[candidateKey] = struct{}{}
+			firstSeen, ok := seen[candidateKey]
+			if !ok {
+				seen[candidateKey] = now
+				continue
+			}
+			if now.Sub(firstSeen) < grace {
+				continue
+			}
+
+			if err := catalogDeregisterService(ctx, cfg, consulHTTP, inst.Node, inst.ServiceID); err != nil {
+				log.Printf("gc deregister failed service_id=%s node=%s reason=%s err=%v", inst.ServiceID, inst.Node, reason, err)
+				continue
+			}
+			delete(seen, candidateKey)
+			removed++
+			log.Printf("gc deregistered stale service service_id=%s node=%s reason=%s", inst.ServiceID, inst.Node, reason)
+		}
+	}
+
+	for key := range seen {
+		if _, ok := activeCandidates[key]; !ok {
+			delete(seen, key)
+		}
+	}
+
+	log.Printf("gc sweep complete: alive_owners=%d removed=%d", len(aliveOwners), removed)
+	return nil
+}
+
+func listAliveOwners(ctx context.Context, cfg config, consulHTTP *http.Client) (map[string]struct{}, error) {
+	u := strings.TrimRight(cfg.consulHTTPAddr, "/") + "/v1/health/checks/" + url.PathEscape(ownerHeartbeatService)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.consulToken != "" {
+		req.Header.Set("X-Consul-Token", cfg.consulToken)
+	}
+
+	resp, err := consulHTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return map[string]struct{}{}, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("consul API returned %s", resp.Status)
+	}
+
+	var checks []consulHealthCheck
+	if err := json.NewDecoder(resp.Body).Decode(&checks); err != nil {
+		return nil, err
+	}
+
+	alive := map[string]struct{}{}
+	for _, check := range checks {
+		if check.Status != "passing" {
+			continue
+		}
+		serviceID := strings.TrimSpace(check.ServiceID)
+		if !strings.HasPrefix(serviceID, ownerHeartbeatIDPrefix) {
+			continue
+		}
+		owner := strings.TrimPrefix(serviceID, ownerHeartbeatIDPrefix)
+		owner = strings.TrimSpace(owner)
+		if owner == "" {
+			continue
+		}
+		alive[owner] = struct{}{}
+	}
+	return alive, nil
+}
+
+func listCatalogServiceNames(ctx context.Context, cfg config, consulHTTP *http.Client) ([]string, error) {
+	u := strings.TrimRight(cfg.consulHTTPAddr, "/") + "/v1/catalog/services"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.consulToken != "" {
+		req.Header.Set("X-Consul-Token", cfg.consulToken)
+	}
+
+	resp, err := consulHTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("consul API returned %s", resp.Status)
+	}
+
+	var raw map[string][]string
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, err
+	}
+
+	names := make([]string, 0, len(raw))
+	for name := range raw {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func listCatalogServiceInstances(
+	ctx context.Context,
+	cfg config,
+	consulHTTP *http.Client,
+	serviceName string,
+) ([]consulCatalogServiceInstance, error) {
+	u := strings.TrimRight(cfg.consulHTTPAddr, "/") + "/v1/catalog/service/" + url.PathEscape(serviceName)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.consulToken != "" {
+		req.Header.Set("X-Consul-Token", cfg.consulToken)
+	}
+
+	resp, err := consulHTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("consul API returned %s", resp.Status)
+	}
+
+	var instances []consulCatalogServiceInstance
+	if err := json.NewDecoder(resp.Body).Decode(&instances); err != nil {
+		return nil, err
+	}
+	return instances, nil
+}
+
+func catalogDeregisterService(
+	ctx context.Context,
+	cfg config,
+	consulHTTP *http.Client,
+	node string,
+	serviceID string,
+) error {
+	payload := map[string]string{
+		"Node":      node,
+		"ServiceID": serviceID,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	u := strings.TrimRight(cfg.consulHTTPAddr, "/") + "/v1/catalog/deregister"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if cfg.consulToken != "" {
+		req.Header.Set("X-Consul-Token", cfg.consulToken)
+	}
+
+	resp, err := consulHTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("consul API returned %s", resp.Status)
 	}
@@ -436,14 +794,32 @@ func loadConfig() config {
 		consulHTTPAddr:       getEnv("CONSUL_HTTP_ADDR", "http://127.0.0.1:8500"),
 		consulToken:          os.Getenv("CONSUL_HTTP_TOKEN"),
 		dockerSocket:         getEnv("DOCKER_SOCKET", "/var/run/docker.sock"),
-		resyncInterval:       mustParseDuration(getEnv("POLL_INTERVAL", "5m")),
+		resyncInterval:       mustParseDurationEnv("POLL_INTERVAL", "5m"),
 		requireTraefikEnable: isTruthy(getEnv("REQUIRE_TRAEFIK_ENABLE", "true")),
+		ownerID:              defaultOwnerID(),
+		ownerHeartbeatTTL:    mustParseDurationEnv("OWNER_HEARTBEAT_TTL", "30s"),
+		ownerHeartbeatPass:   mustParseDurationEnv("OWNER_HEARTBEAT_PASS_INTERVAL", "10s"),
+		gcInterval:           mustParseDurationEnv("GC_INTERVAL", "1m"),
+		orphanGrace:          mustParseDurationEnv("ORPHAN_GRACE_PERIOD", "10m"),
+		ownerDownGrace:       mustParseDurationEnv("OWNER_DOWN_GRACE_PERIOD", "10m"),
 		serviceIDPrefix:      getEnv("SERVICE_ID_PREFIX", "docker-"),
 		serviceNameLabel:     getEnv("SERVICE_NAME_LABEL", "com.docker.compose.service"),
 		servicePortLabel:     getEnv("SERVICE_PORT_LABEL", "consul.port"),
 		serviceAddressLabel:  getEnv("SERVICE_ADDRESS_LABEL", "consul.address"),
 		defaultServiceName:   getEnv("DEFAULT_SERVICE_NAME", "container"),
 	}
+}
+
+func defaultOwnerID() string {
+	if value := strings.TrimSpace(os.Getenv("OWNER_ID")); value != "" {
+		return value
+	}
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(hostname)
 }
 
 func newDockerHTTPClient(socketPath string) *http.Client {
@@ -484,10 +860,11 @@ func firstContainerName(names []string) string {
 	return strings.TrimPrefix(strings.TrimSpace(names[0]), "/")
 }
 
-func mustParseDuration(raw string) time.Duration {
+func mustParseDurationEnv(key, fallback string) time.Duration {
+	raw := getEnv(key, fallback)
 	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
-		log.Fatalf("invalid POLL_INTERVAL: %q", raw)
+		log.Fatalf("invalid %s: %q", key, raw)
 	}
 	return d
 }

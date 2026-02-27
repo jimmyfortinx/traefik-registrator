@@ -39,6 +39,10 @@ services:
     environment:
       CONSUL_HTTP_ADDR: http://consul:8500
       POLL_INTERVAL: 5s
+      GC_INTERVAL: 5s
+      OWNER_ID: local-dev-server
+      ORPHAN_GRACE_PERIOD: 20s
+      OWNER_DOWN_GRACE_PERIOD: 20s
       SERVICE_ID_PREFIX: docker-
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
