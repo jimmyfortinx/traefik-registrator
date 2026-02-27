@@ -992,7 +992,7 @@ func sweepStaleServices(
 	consulHTTP *http.Client,
 	seen map[string]time.Time,
 ) error {
-	aliveOwners, err := listAliveOwners(ctx, cfg, consulHTTP)
+	aliveOwnersByNode, err := listAliveOwnersByNode(ctx, cfg, consulHTTP)
 	if err != nil {
 		return err
 	}
@@ -1035,8 +1035,10 @@ func sweepStaleServices(
 			if owner == "" {
 				reason = "missing owner-id"
 				grace = cfg.orphanGrace
-			} else if _, ok := aliveOwners[owner]; !ok {
+			} else if nodes, ok := aliveOwnersByNode[owner]; !ok {
 				reason = "owner heartbeat missing"
+			} else if !ownerPassingOnNode(nodes, inst.Node) {
+				reason = "owner heartbeat missing on node"
 			} else {
 				continue
 			}
@@ -1068,11 +1070,15 @@ func sweepStaleServices(
 		}
 	}
 
-	log.Printf("gc sweep complete: alive_owners=%d removed=%d", len(aliveOwners), removed)
+	log.Printf("gc sweep complete: alive_owners=%d removed=%d", len(aliveOwnersByNode), removed)
 	return nil
 }
 
-func listAliveOwners(ctx context.Context, cfg config, consulHTTP *http.Client) (map[string]struct{}, error) {
+func listAliveOwnersByNode(
+	ctx context.Context,
+	cfg config,
+	consulHTTP *http.Client,
+) (map[string]map[string]struct{}, error) {
 	u := strings.TrimRight(cfg.consulHTTPAddr, "/") + "/v1/health/checks/" + url.PathEscape(ownerHeartbeatService)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -1088,7 +1094,7 @@ func listAliveOwners(ctx context.Context, cfg config, consulHTTP *http.Client) (
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return map[string]struct{}{}, nil
+		return map[string]map[string]struct{}{}, nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("consul API returned %s", resp.Status)
@@ -1099,7 +1105,7 @@ func listAliveOwners(ctx context.Context, cfg config, consulHTTP *http.Client) (
 		return nil, err
 	}
 
-	alive := map[string]struct{}{}
+	alive := map[string]map[string]struct{}{}
 	for _, check := range checks {
 		if check.Status != "passing" {
 			continue
@@ -1113,9 +1119,28 @@ func listAliveOwners(ctx context.Context, cfg config, consulHTTP *http.Client) (
 		if owner == "" {
 			continue
 		}
-		alive[owner] = struct{}{}
+		nodes := alive[owner]
+		if nodes == nil {
+			nodes = map[string]struct{}{}
+			alive[owner] = nodes
+		}
+		node := strings.TrimSpace(check.Node)
+		// Be conservative if Consul omits node from a passing check.
+		// Empty node acts as wildcard to avoid false-positive cleanup.
+		nodes[node] = struct{}{}
 	}
 	return alive, nil
+}
+
+func ownerPassingOnNode(nodes map[string]struct{}, node string) bool {
+	if len(nodes) == 0 {
+		return false
+	}
+	if _, ok := nodes[""]; ok {
+		return true
+	}
+	_, ok := nodes[strings.TrimSpace(node)]
+	return ok
 }
 
 func listCatalogServiceNames(ctx context.Context, cfg config, consulHTTP *http.Client) ([]string, error) {
