@@ -1,0 +1,165 @@
+services:
+  consul:
+    image: hashicorp/consul:1.20
+    command: agent -dev -client=0.0.0.0
+    healthcheck:
+      test: ["CMD", "consul", "info"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  seed:
+    image: python:3.13-alpine
+    depends_on:
+      consul:
+        condition: service_healthy
+    command:
+      - python
+      - -c
+      - |
+        import json
+        import time
+        import urllib.request
+
+        consul = "http://consul:8500"
+
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(consul + "/v1/status/leader", timeout=3) as resp:
+                    leader = resp.read().decode().strip().strip('"')
+                    if leader:
+                        break
+            except Exception:
+                pass
+            time.sleep(1)
+        else:
+            raise SystemExit("consul did not become ready")
+
+        def put(path, payload):
+            req = urllib.request.Request(
+                consul + path,
+                data=json.dumps(payload).encode(),
+                method="PUT",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"unexpected status {resp.status}")
+
+        put(
+            "/v1/catalog/register",
+            {
+                "Node": "seed-node-a",
+                "Address": "10.200.0.1",
+                "Service": {
+                    "ID": "seed-orphan",
+                    "Service": "orphan-app",
+                    "Address": "10.200.1.10",
+                    "Port": 8080,
+                    "Meta": {
+                        "managed-by": "traefik-registrator",
+                    },
+                },
+            },
+        )
+
+        put(
+            "/v1/catalog/register",
+            {
+                "Node": "seed-node-b",
+                "Address": "10.200.0.2",
+                "Service": {
+                    "ID": "seed-dead-owner",
+                    "Service": "dead-owner-app",
+                    "Address": "10.200.1.11",
+                    "Port": 8081,
+                    "Meta": {
+                        "managed-by": "traefik-registrator",
+                        "owner-id": "dead-owner",
+                    },
+                },
+            },
+        )
+
+        print("seeded stale services")
+        while True:
+            time.sleep(60)
+
+  registrator:
+    image: traefik-registrator:test
+    build:
+      context: ../..
+    depends_on:
+      consul:
+        condition: service_healthy
+    environment:
+      CONSUL_HTTP_ADDR: http://consul:8500
+      POLL_INTERVAL: 2s
+      GC_INTERVAL: 2s
+      OWNER_ID: live-owner
+      ORPHAN_GRACE_PERIOD: 4s
+      OWNER_DOWN_GRACE_PERIOD: 4s
+      SERVICE_ID_PREFIX: docker-
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  verify:
+    image: python:3.13-alpine
+    depends_on:
+      consul:
+        condition: service_healthy
+      seed:
+        condition: service_started
+      registrator:
+        condition: service_started
+    command:
+      - python
+      - -c
+      - |
+        import json
+        import time
+        import urllib.parse
+        import urllib.request
+
+        consul = "http://consul:8500"
+
+        def list_instances(name):
+            encoded = urllib.parse.quote(name, safe="")
+            with urllib.request.urlopen(consul + f"/v1/catalog/service/{encoded}", timeout=3) as resp:
+                return json.load(resp)
+
+        def has_id(items, service_id):
+            return any(item.get("ServiceID") == service_id for item in items)
+
+        def wait_until(description, predicate, timeout):
+            deadline = time.time() + timeout
+            last = None
+            while time.time() < deadline:
+                try:
+                    last = predicate()
+                    if last is True:
+                        return
+                except Exception:
+                    pass
+                time.sleep(1)
+            raise RuntimeError(f"timeout waiting for {description}; last={last}")
+
+        def seeded_present():
+            orphan = list_instances("orphan-app")
+            dead = list_instances("dead-owner-app")
+            if has_id(orphan, "seed-orphan") and has_id(dead, "seed-dead-owner"):
+                return True
+            return {"orphan": orphan, "dead": dead}
+
+        wait_until("seeded stale services", seeded_present, timeout=30)
+
+        def stale_removed():
+            orphan = list_instances("orphan-app")
+            dead = list_instances("dead-owner-app")
+            if not has_id(orphan, "seed-orphan") and not has_id(dead, "seed-dead-owner"):
+                return True
+            return {"orphan": orphan, "dead": dead}
+
+        wait_until("stale services to be garbage-collected", stale_removed, timeout=60)
+        print("gc-stale-services scenario passed")

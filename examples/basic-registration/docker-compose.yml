@@ -1,0 +1,105 @@
+services:
+  consul:
+    image: hashicorp/consul:1.20
+    command: agent -dev -client=0.0.0.0
+    healthcheck:
+      test: ["CMD", "consul", "info"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  whoami:
+    image: traefik/whoami:v1.11
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.whoami.rule: Host(`whoami.local`)
+      traefik.http.services.whoami.loadbalancer.server.port: "80"
+
+  registrator:
+    image: traefik-registrator:test
+    build:
+      context: ../..
+    depends_on:
+      consul:
+        condition: service_healthy
+    environment:
+      CONSUL_HTTP_ADDR: http://consul:8500
+      POLL_INTERVAL: 2s
+      GC_INTERVAL: 2s
+      OWNER_ID: example-basic
+      ORPHAN_GRACE_PERIOD: 20s
+      OWNER_DOWN_GRACE_PERIOD: 20s
+      SERVICE_ID_PREFIX: docker-
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  verify:
+    image: python:3.13-alpine
+    depends_on:
+      consul:
+        condition: service_healthy
+      registrator:
+        condition: service_started
+      whoami:
+        condition: service_started
+    command:
+      - python
+      - -c
+      - |
+        import json
+        import sys
+        import time
+        import urllib.request
+
+        consul = "http://consul:8500"
+        deadline = time.time() + 90
+        expected_owner = "example-basic"
+        expected_tags = {
+            "traefik.enable=true",
+            "traefik.http.routers.whoami.rule=Host(`whoami.local`)",
+            "traefik.http.services.whoami.loadbalancer.server.port=80",
+        }
+        last_services = None
+
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(consul + "/v1/agent/services", timeout=3) as resp:
+                    last_services = json.load(resp)
+            except Exception:
+                time.sleep(1)
+                continue
+
+            managed = []
+            owner_heartbeat = False
+            for service in last_services.values():
+                meta = service.get("Meta", {})
+                if meta.get("managed-by") != "traefik-registrator":
+                    continue
+                if meta.get("kind") == "owner-heartbeat":
+                    owner_heartbeat = True
+                    continue
+                managed.append(service)
+
+            candidate = None
+            for service in managed:
+                if service.get("Service") == "whoami":
+                    candidate = service
+                    break
+
+            if candidate is not None and owner_heartbeat:
+                svc = candidate
+                tags = set(svc.get("Tags", []))
+                if (
+                    svc.get("Port") == 80
+                    and svc.get("Address")
+                    and svc.get("Meta", {}).get("owner-id") == expected_owner
+                    and expected_tags.issubset(tags)
+                ):
+                    print("basic-registration scenario passed")
+                    raise SystemExit(0)
+
+            time.sleep(1)
+
+        print("basic-registration scenario failed")
+        print(json.dumps(last_services, indent=2))
+        raise SystemExit(1)

@@ -1,0 +1,93 @@
+services:
+  consul:
+    image: hashicorp/consul:1.20
+    command: agent -dev -client=0.0.0.0
+    healthcheck:
+      test: ["CMD", "consul", "info"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    image: traefik/whoami:v1.11
+    labels:
+      registrator.name: payments-api
+      registrator.address: 10.9.8.7
+      registrator.port: "9090"
+
+  registrator:
+    image: traefik-registrator:test
+    build:
+      context: ../..
+    depends_on:
+      consul:
+        condition: service_healthy
+    environment:
+      CONSUL_HTTP_ADDR: http://consul:8500
+      POLL_INTERVAL: 2s
+      GC_INTERVAL: 2s
+      OWNER_ID: example-custom
+      REQUIRE_TRAEFIK_ENABLE: "false"
+      SERVICE_NAME_LABEL: registrator.name
+      SERVICE_ADDRESS_LABEL: registrator.address
+      SERVICE_PORT_LABEL: registrator.port
+      ORPHAN_GRACE_PERIOD: 20s
+      OWNER_DOWN_GRACE_PERIOD: 20s
+      SERVICE_ID_PREFIX: docker-
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  verify:
+    image: python:3.13-alpine
+    depends_on:
+      consul:
+        condition: service_healthy
+      registrator:
+        condition: service_started
+      app:
+        condition: service_started
+    command:
+      - python
+      - -c
+      - |
+        import json
+        import sys
+        import time
+        import urllib.request
+
+        consul = "http://consul:8500"
+        deadline = time.time() + 90
+        last_services = None
+
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(consul + "/v1/agent/services", timeout=3) as resp:
+                    last_services = json.load(resp)
+            except Exception:
+                time.sleep(1)
+                continue
+
+            managed = []
+            for service in last_services.values():
+                meta = service.get("Meta", {})
+                if meta.get("managed-by") != "traefik-registrator":
+                    continue
+                if meta.get("kind") == "owner-heartbeat":
+                    continue
+                managed.append(service)
+
+            for svc in managed:
+                if (
+                    svc.get("Service") == "payments-api"
+                    and svc.get("Address") == "10.9.8.7"
+                    and svc.get("Port") == 9090
+                    and svc.get("Meta", {}).get("owner-id") == "example-custom"
+                ):
+                    print("custom-label-overrides scenario passed")
+                    raise SystemExit(0)
+
+            time.sleep(1)
+
+        print("custom-label-overrides scenario failed")
+        print(json.dumps(last_services, indent=2))
+        raise SystemExit(1)
