@@ -1,20 +1,25 @@
 # traefik-registrator
 
-Small Docker-to-Consul registrator focused on Traefik labels.
+Docker/file to Consul registrator focused on Traefik tags.
 
-It listens to Docker container events, registers/deregisters services in Consul, and converts each `traefik.*` label into a Consul tag (`key=value`).
+In `docker` mode, it listens to Docker container events and converts each `traefik.*` label into a Consul tag (`key=value`).
+In `file` mode, it reads service definitions from a file or directory and keeps Consul in sync.
 
 ## Behavior
 
-- Registers one Consul service per running container.
-- Watches Docker events (`start`, `stop`, `die`, `destroy`) and syncs immediately.
-- Runs a periodic full resync as a safety fallback.
+- Supports two discovery modes:
+  - `SOURCE_MODE=docker` (default): discover services from running containers.
+  - `SOURCE_MODE=file`: discover services from YAML/YML file(s).
+- Runs a periodic full resync as a safety fallback in both modes.
 - Registers a heartbeat service per registrator owner (`traefik-registrator-owner`).
 - Periodically sweeps stale registrations cluster-wide:
   - removes services with missing `owner-id` after `ORPHAN_GRACE_PERIOD`
   - removes services whose owner heartbeat is not passing after `OWNER_DOWN_GRACE_PERIOD`
-- By default, only containers with `traefik.enable=true` are registered.
-- Service ID: `<SERVICE_ID_PREFIX><container-id-12chars>`.
+- In `docker` mode:
+  - Watches Docker events (`start`, `stop`, `die`, `destroy`) and syncs immediately.
+  - By default, only containers with `traefik.enable=true` are registered.
+- Service ID in `docker` mode: `<SERVICE_ID_PREFIX><container-id-12chars>`.
+- Service ID in `file` mode: explicit `id` from file or generated deterministic ID with `SERVICE_ID_PREFIX`.
 - Service metadata:
   - `managed-by=traefik-registrator`
   - `owner-id=<OWNER_ID or hostname fallback>`
@@ -31,15 +36,21 @@ It listens to Docker container events, registers/deregisters services in Consul,
   - label from `SERVICE_PORT_LABEL` (default: `consul.port`)
   - first Traefik label matching `traefik.http.services.*.loadbalancer.server.port`
   - first exposed private container port
-- Deregisters services when containers disappear.
+- In `file` mode:
+  - Watches source path changes via filesystem events and triggers sync automatically.
+  - Reads services from a YAML/YML file or all `.yaml`/`.yml` files in a directory.
+  - If source files are temporarily unavailable or invalid, sync fails and current Consul registrations are preserved.
+- Deregisters services only when a sync successfully computes the desired state without those services.
 
 ## Environment
 
 - `CONSUL_HTTP_ADDR` (default: `http://127.0.0.1:8500`)
 - `CONSUL_HTTP_TOKEN` (optional)
-- `DOCKER_SOCKET` (default: `/var/run/docker.sock`)
+- `SOURCE_MODE` (default: `docker`, values: `docker`, `file`)
+- `DOCKER_SOCKET` (default: `/var/run/docker.sock`, docker mode only)
+- `FILE_SOURCE_PATH` (default: `/etc/traefik-registrator/services.d`, file mode only)
 - `POLL_INTERVAL` (default: `5m`, periodic full-resync interval)
-- `REQUIRE_TRAEFIK_ENABLE` (default: `true`)
+- `REQUIRE_TRAEFIK_ENABLE` (default: `true`, docker mode only)
 - `OWNER_ID` (optional, recommended: stable per-server ID; fallback: hostname)
 - `OWNER_HEARTBEAT_TTL` (default: `30s`)
 - `OWNER_HEARTBEAT_PASS_INTERVAL` (default: `10s`, must be lower than TTL)
@@ -51,6 +62,37 @@ It listens to Docker container events, registers/deregisters services in Consul,
 - `SERVICE_PORT_LABEL` (default: `consul.port`)
 - `SERVICE_ADDRESS_LABEL` (default: `consul.address`)
 - `DEFAULT_SERVICE_NAME` (default: `container`)
+
+## File Mode Schema
+
+`FILE_SOURCE_PATH` can point to:
+
+- a single `.yaml` or `.yml` file, or
+- a directory containing `.yaml`/`.yml` files.
+
+Supported YAML shape:
+
+- Object with `services` keyed map:
+
+```yaml
+services:
+  whoami:
+    address: whoami-file
+    port: 80
+    tags:
+      - traefik.enable=true
+      - traefik.http.routers.whoami-file.rule=Host(`whoami-file.local`)
+```
+
+Fields:
+
+- `address` and `port` are required.
+- `id` is optional.
+- `name` is optional.
+- Missing `name` defaults to the map key.
+- Missing `id` defaults to `<SERVICE_ID_PREFIX><key>`.
+- You do not need to duplicate the port in a Traefik `...loadbalancer.server.port` tag unless you explicitly want to override behavior in Traefik.
+- `tags` and `meta` are optional.
 
 ## Build Image
 
@@ -79,6 +121,21 @@ If your workload does not set `traefik.enable=true`, disable that filter with:
 -e REQUIRE_TRAEFIK_ENABLE=false
 ```
 
+Run in file mode (single central config path mounted read-only):
+
+```bash
+docker run -d \
+  --name traefik-registrator-file \
+  -v /srv/traefik-registrator/services.d:/etc/traefik-registrator/services.d:ro \
+  -e SOURCE_MODE=file \
+  -e FILE_SOURCE_PATH=/etc/traefik-registrator/services.d \
+  -e CONSUL_HTTP_ADDR=http://consul.service.consul:8500 \
+  -e OWNER_ID=file-source-a \
+  -e SERVICE_ID_PREFIX=file- \
+  --restart unless-stopped \
+  traefik-registrator:local
+```
+
 ## Local End-to-End Test
 
 `docker-compose.yml` starts:
@@ -86,7 +143,9 @@ If your workload does not set `traefik.enable=true`, disable that filter with:
 - `consul` in dev mode (UI/API on `http://localhost:8500`)
 - `traefik` configured from `traefik.yml` with Consul Catalog provider (`http://localhost:8080`)
 - `whoami` test app with Traefik labels
+- `whoami-file` test app without Docker labels (registered by file mode)
 - `registrator` built from this repository
+- `registrator-file` built from this repository using file mode
 
 Start the stack:
 
@@ -100,22 +159,33 @@ Check registrator logs:
 docker compose logs -f registrator
 ```
 
-Verify that the test app was registered:
+Check file-mode registrator logs:
+
+```bash
+docker compose logs -f registrator-file
+```
+
+Verify that services were registered:
 
 ```bash
 curl -s http://localhost:8500/v1/agent/services
 ```
 
-The entry for `whoami` should include tags generated from labels, for example:
+The `whoami` entry should include tags generated from Docker labels, for example:
 
 - `traefik.enable=true`
 - `traefik.http.routers.whoami.rule=Host(\`whoami.local\`)`
 - `traefik.http.services.whoami.loadbalancer.server.port=80`
 
+The `file-whoami` entry should include tags loaded from `examples/services.d/whoami-file.yml`, including:
+
+- `traefik.http.routers.whoami-file.rule=Host(\`whoami-file.local\`)`
+
 Verify Traefik discovers and routes from Consul tags:
 
 ```bash
 curl -s -H 'Host: whoami.local' http://localhost:8080
+curl -s -H 'Host: whoami-file.local' http://localhost:8080
 ```
 
 You should get the `whoami` response body.

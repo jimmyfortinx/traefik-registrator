@@ -30,6 +30,9 @@ services:
       traefik.http.routers.whoami.rule: Host(`whoami.local`)
       traefik.http.services.whoami.loadbalancer.server.port: "80"
 
+  whoami-file:
+    image: traefik/whoami:v1.11
+
   registrator:
     build:
       context: .
@@ -46,3 +49,22 @@ services:
       SERVICE_ID_PREFIX: docker-
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+
+  registrator-file:
+    build:
+      context: .
+    depends_on:
+      consul:
+        condition: service_healthy
+    environment:
+      SOURCE_MODE: file
+      FILE_SOURCE_PATH: /etc/traefik-registrator/services.d
+      CONSUL_HTTP_ADDR: http://consul:8500
+      POLL_INTERVAL: 1h
+      GC_INTERVAL: 5s
+      OWNER_ID: local-dev-file-source
+      ORPHAN_GRACE_PERIOD: 20s
+      OWNER_DOWN_GRACE_PERIOD: 20s
+      SERVICE_ID_PREFIX: file-
+    volumes:
+      - ./examples/services.d:/etc/traefik-registrator/services.d:ro
