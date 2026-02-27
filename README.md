@@ -127,6 +127,40 @@ Stop and remove the stack:
 docker compose down -v
 ```
 
+## Automated Tests
+
+The project now ships with:
+
+- Go unit tests for registration/sync/GC logic.
+- Compose integration tests that run against real Docker + Consul stacks.
+
+Run unit tests only:
+
+```bash
+go test ./...
+```
+
+Run compose integration scenarios from your host:
+
+```bash
+RUN_COMPOSE_TESTS=1 go test -v ./...
+```
+
+Run all tests in an isolated container (no published ports):
+
+```bash
+docker compose -f tests/docker-compose.test.yml run --rm tests
+```
+
+## Compose Test Examples
+
+All scenario files are in `examples/` and intentionally publish no ports, so multiple worktrees can run them concurrently.
+
+- `examples/basic-registration`: registers a Traefik-enabled service, checks tags/meta, checks owner heartbeat service.
+- `examples/traefik-enable-filter`: verifies `REQUIRE_TRAEFIK_ENABLE=true` filtering.
+- `examples/custom-label-overrides`: verifies `SERVICE_*_LABEL` overrides and `REQUIRE_TRAEFIK_ENABLE=false`.
+- `examples/gc-stale-services`: seeds stale catalog entries and verifies GC cleanup for orphan and dead-owner services.
+
 ## GitHub Actions
 
 Workflow file: `.github/workflows/docker.yml`
