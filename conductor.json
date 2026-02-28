@@ -1,5 +1,7 @@
 {
     "scripts": {
-        "run": "docker compose up --build -d"
+        "setup": "bun install",
+        "run": "docker compose up --build -d",
+        "archive": "bun run clean"
     }
 }
