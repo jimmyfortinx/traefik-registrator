@@ -6,7 +6,8 @@
   },
   "scripts": {
     "start": "bun run src/main.ts",
-    "test:e2e": "bun test tests/e2e/examples.test.ts",
+    "test:e2e:in-container": "bun test tests/e2e/examples.test.ts",
+    "test:e2e": "docker compose -f tests/docker-compose.test.yml run --rm tests",
     "test": "bun run test:e2e",
     "clean": "rm -rf node_modules"
   }
