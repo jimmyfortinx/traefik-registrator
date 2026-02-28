@@ -78,6 +78,10 @@ const ownerIDMetaKey = "owner-id";
 const ownerHeartbeatService = "traefik-registrator-owner";
 const ownerHeartbeatIDPrefix = "traefik-registrator-owner-";
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function env(name: string, fallback: string): string {
   const value = process.env[name];
   return value === undefined || value.trim() === "" ? fallback : value.trim();
@@ -853,7 +857,7 @@ async function run(): Promise<void> {
       lastGC = Date.now();
     }
 
-    await Bun.sleep(200);
+    await sleep(200);
   }
 
   closeWatcher?.();
