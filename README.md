@@ -16,7 +16,7 @@ In `file` mode, it reads service definitions from a file or directory and keeps 
   - removes services with missing `owner-id` after `ORPHAN_GRACE_PERIOD`
   - removes services whose owner heartbeat is not passing on that Consul node after `OWNER_DOWN_GRACE_PERIOD`
 - In `docker` mode:
-  - Watches Docker events (`start`, `stop`, `die`, `destroy`) and syncs immediately.
+  - Polls running containers and reconciles registrations on each sync interval.
   - By default, only containers with `traefik.enable=true` are registered.
 - Service ID in `docker` mode: `<SERVICE_ID_PREFIX><container-id-12chars>`.
 - Service ID in `file` mode: explicit `id` from file or generated deterministic ID with `SERVICE_ID_PREFIX`.
@@ -275,19 +275,18 @@ docker compose down -v
 
 The project now ships with:
 
-- Go unit tests for registration/sync/GC logic.
-- Compose integration tests that run against real Docker + Consul stacks.
+- Bun e2e tests that run real Docker Compose + Consul stacks and assert behavior externally.
 
-Run unit tests only:
+Run e2e Compose scenarios:
 
 ```bash
-go test ./...
+bun run test:e2e
 ```
 
-Run compose integration scenarios from your host:
+Run full test suite:
 
 ```bash
-RUN_COMPOSE_TESTS=1 go test -v ./...
+bun run test
 ```
 
 Run all tests in an isolated container (no published ports):
