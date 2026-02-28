@@ -1,1 +1,3 @@
 traefik-registrator
+node_modules
+bun.lock

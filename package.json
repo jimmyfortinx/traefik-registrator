@@ -1,0 +1,12 @@
+{
+  "name": "traefik-registrator",
+  "private": true,
+  "dependencies": {
+    "yaml": "^2.8.1"
+  },
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "test:e2e": "bun test tests/e2e/examples.test.ts",
+    "test": "bun run test:e2e"
+  }
+}

@@ -1,17 +1,22 @@
-FROM golang:1.24-alpine AS build
+FROM oven/bun:1.2.22-alpine AS build
 
-RUN apk add --no-cache ca-certificates
 WORKDIR /src
 
-COPY go.mod go.sum ./
-RUN go mod download
-COPY main.go ./
+COPY package.json ./
+RUN bun install --production
+COPY src ./src
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/traefik-registrator .
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+      amd64) target="bun-linux-x64-musl" ;; \
+      arm64) target="bun-linux-arm64-musl" ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" && exit 1 ;; \
+    esac && \
+    bun build --compile --target "${target}" --outfile /out/traefik-registrator ./src/main.ts
 
-FROM scratch
+FROM alpine:3.20
 
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=build /out/traefik-registrator /traefik-registrator
+RUN apk add --no-cache ca-certificates libstdc++
+COPY --from=build /out/traefik-registrator /usr/local/bin/traefik-registrator
 
-ENTRYPOINT ["/traefik-registrator"]
+ENTRYPOINT ["/usr/local/bin/traefik-registrator"]
