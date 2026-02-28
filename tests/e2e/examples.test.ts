@@ -1,5 +1,6 @@
 import { beforeAll, describe } from "bun:test";
 import {
+  compose,
   consulJson,
   containerState,
   managedServices,
