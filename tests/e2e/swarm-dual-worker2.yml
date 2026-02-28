@@ -1,0 +1,8 @@
+services:
+  whoami_worker2:
+    image: traefik/whoami:v1.11.0
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.trreg_worker2 == true

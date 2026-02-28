@@ -1,0 +1,10 @@
+services:
+  whoami-worker2:
+    id: file-whoami-worker2
+    name: whoami-worker2
+    address: whoami-worker2
+    port: 80
+    tags:
+      - traefik.enable=true
+      - traefik.http.routers.whoami-worker2.rule=Host(`whoami-worker2.swarm.local`)
+      - traefik.http.services.whoami-worker2.loadbalancer.server.port=80

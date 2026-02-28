@@ -1,0 +1,42 @@
+services:
+  consul:
+    image: hashicorp/consul:1.22.3
+    command: agent -dev -client=0.0.0.0
+    ports:
+      - target: 8500
+        published: 18500
+        protocol: tcp
+        mode: host
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  whoami:
+    image: traefik/whoami:v1.11.0
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.whoami.rule=Host(`whoami.swarm.local`)
+      - traefik.http.services.whoami.loadbalancer.server.port=80
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  registrator:
+    image: traefik-registrator:swarm-e2e
+    environment:
+      CONSUL_HTTP_ADDR: http://tasks.consul:8500
+      OWNER_ID: swarm-manager
+      POLL_INTERVAL: 5s
+      GC_INTERVAL: 5s
+      ORPHAN_GRACE_PERIOD: 20s
+      OWNER_DOWN_GRACE_PERIOD: 20s
+      SERVICE_ID_PREFIX: docker-
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager

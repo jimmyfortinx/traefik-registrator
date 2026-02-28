@@ -27,8 +27,31 @@ jobs:
       - name: Run unit and compose test suite
         run: docker compose -f tests/docker-compose.test.yml run --rm tests
 
+  swarm-tests:
+    if: vars.RUN_SWARM_E2E == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Show Docker versions
+        run: |
+          docker version
+          docker compose version
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Run swarm e2e suite
+        run: bun run test:swarm-e2e
+
   image:
-    needs: tests
+    needs:
+      - tests
+      - swarm-tests
+    if: always() && needs.tests.result == 'success' && (needs.swarm-tests.result == 'success' || needs.swarm-tests.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
