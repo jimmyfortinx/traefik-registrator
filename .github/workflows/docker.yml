@@ -28,7 +28,6 @@ jobs:
         run: docker compose -f tests/docker-compose.test.yml run --rm tests
 
   swarm-tests:
-    if: vars.RUN_SWARM_E2E == '1'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -51,7 +50,7 @@ jobs:
     needs:
       - tests
       - swarm-tests
-    if: always() && needs.tests.result == 'success' && (needs.swarm-tests.result == 'success' || needs.swarm-tests.result == 'skipped')
+    if: always() && needs.tests.result == 'success' && needs.swarm-tests.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

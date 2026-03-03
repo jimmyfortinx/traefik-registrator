@@ -13,14 +13,8 @@ type Config = {
   sourceMode: SourceMode;
   dockerSocket: string;
   fileSourcePath: string;
-  resyncIntervalMs: number;
   requireTraefikEnable: boolean;
   ownerID: string;
-  ownerHeartbeatTTLMs: number;
-  ownerHeartbeatPassMs: number;
-  gcIntervalMs: number;
-  orphanGraceMs: number;
-  ownerDownGraceMs: number;
   serviceIDPrefix: string;
   serviceNameLabel: string;
   servicePortLabel: string;
@@ -38,6 +32,13 @@ type DockerContainer = {
   NetworkSettings?: { Networks?: Record<string, DockerNetworkEndpoint> };
 };
 
+type DockerEvent = {
+  Type?: string;
+  Action?: string;
+  status?: string;
+  id?: string;
+};
+
 type ConsulServiceRegistration = {
   ID: string;
   Name: string;
@@ -45,19 +46,12 @@ type ConsulServiceRegistration = {
   Port?: number;
   Tags?: string[];
   Meta?: Record<string, string>;
-  Check?: {
-    Name?: string;
-    TTL?: string;
-    DeregisterCriticalServiceAfter?: string;
-  };
 };
 
 type AgentService = { ID?: string; Meta?: Record<string, string> };
-type OwnerCheck = { Node?: string; ServiceID?: string; Status?: string };
 type CatalogInstance = {
   Node?: string;
   ServiceID?: string;
-  ServiceName?: string;
   ServiceMeta?: Record<string, string>;
 };
 
@@ -75,8 +69,6 @@ const sourceModeFile: SourceMode = "file";
 const managedByMetaKey = "managed-by";
 const managedByMetaValue = "traefik-registrator";
 const ownerIDMetaKey = "owner-id";
-const ownerHeartbeatService = "traefik-registrator-owner";
-const ownerHeartbeatIDPrefix = "traefik-registrator-owner-";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -91,36 +83,6 @@ function parseBool(raw: string): boolean {
   return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
 }
 
-function parseDurationMs(raw: string): number {
-  const value = raw.trim();
-  if (value === "") {
-    throw new Error("duration cannot be empty");
-  }
-
-  const match = value.match(/^(-?\d+(?:\.\d+)?)(ms|s|m|h)$/i);
-  if (!match) {
-    throw new Error(`invalid duration ${value}; expected format like 500ms, 2s, 5m, 1h`);
-  }
-
-  const amount = Number(match[1]);
-  const unit = match[2].toLowerCase();
-  const multipliers: Record<string, number> = {
-    ms: 1,
-    s: 1000,
-    m: 60_000,
-    h: 3_600_000,
-  };
-
-  return Math.floor(amount * multipliers[unit]);
-}
-
-function durationToConsulString(ms: number): string {
-  if (ms % 3_600_000 === 0) return `${ms / 3_600_000}h`;
-  if (ms % 60_000 === 0) return `${ms / 60_000}m`;
-  if (ms % 1000 === 0) return `${ms / 1000}s`;
-  return `${ms}ms`;
-}
-
 function loadConfig(): Config {
   const ownerFromHost = process.env.HOSTNAME?.trim() ?? "";
   return {
@@ -129,14 +91,8 @@ function loadConfig(): Config {
     sourceMode: env("SOURCE_MODE", "docker") === "file" ? sourceModeFile : sourceModeDocker,
     dockerSocket: env("DOCKER_SOCKET", "/var/run/docker.sock"),
     fileSourcePath: env("FILE_SOURCE_PATH", "/etc/traefik-registrator/services.d"),
-    resyncIntervalMs: parseDurationMs(env("POLL_INTERVAL", "5m")),
     requireTraefikEnable: parseBool(env("REQUIRE_TRAEFIK_ENABLE", "true")),
     ownerID: env("OWNER_ID", ownerFromHost),
-    ownerHeartbeatTTLMs: parseDurationMs(env("OWNER_HEARTBEAT_TTL", "30s")),
-    ownerHeartbeatPassMs: parseDurationMs(env("OWNER_HEARTBEAT_PASS_INTERVAL", "10s")),
-    gcIntervalMs: parseDurationMs(env("GC_INTERVAL", "1m")),
-    orphanGraceMs: parseDurationMs(env("ORPHAN_GRACE_PERIOD", "10m")),
-    ownerDownGraceMs: parseDurationMs(env("OWNER_DOWN_GRACE_PERIOD", "10m")),
     serviceIDPrefix: env("SERVICE_ID_PREFIX", "docker-"),
     serviceNameLabel: env("SERVICE_NAME_LABEL", "com.docker.compose.service"),
     servicePortLabel: env("SERVICE_PORT_LABEL", "consul.port"),
@@ -148,9 +104,6 @@ function loadConfig(): Config {
 async function validateConfig(cfg: Config): Promise<void> {
   if (!cfg.ownerID.trim()) {
     throw new Error("OWNER_ID resolved to empty value");
-  }
-  if (cfg.ownerHeartbeatPassMs >= cfg.ownerHeartbeatTTLMs) {
-    throw new Error("OWNER_HEARTBEAT_PASS_INTERVAL must be smaller than OWNER_HEARTBEAT_TTL");
   }
 
   if (cfg.sourceMode === sourceModeDocker) {
@@ -215,6 +168,119 @@ async function listRunningContainers(cfg: Config): Promise<DockerContainer[]> {
   return Array.isArray(parsed) ? parsed : [];
 }
 
+function dockerEventStreamPath(): string {
+  const filters = encodeURIComponent(JSON.stringify({ type: ["container"] }));
+  return `/events?filters=${filters}`;
+}
+
+function dockerEventAction(event: DockerEvent): string {
+  return (event.Action ?? event.status ?? "").trim().toLowerCase();
+}
+
+function isDockerEventRelevant(event: DockerEvent): boolean {
+  if ((event.Type ?? "").trim() !== "container") return false;
+  const action = dockerEventAction(event);
+  return ["start", "stop", "die", "kill", "destroy", "unpause", "pause"].includes(action);
+}
+
+async function watchDockerEvents(
+  cfg: Config,
+  onRelevantEvent: (event: DockerEvent) => void,
+  onStreamConnected: () => void,
+  signal: AbortSignal,
+): Promise<void> {
+  while (!signal.aborted) {
+    try {
+      await streamDockerEventsOnce(cfg, onRelevantEvent, onStreamConnected, signal);
+    } catch (error) {
+      if (signal.aborted) break;
+      console.log(`docker event stream error: ${(error as Error).message}`);
+      await sleep(1000);
+      continue;
+    }
+    if (!signal.aborted) await sleep(250);
+  }
+}
+
+function streamDockerEventsOnce(
+  cfg: Config,
+  onRelevantEvent: (event: DockerEvent) => void,
+  onStreamConnected: () => void,
+  signal: AbortSignal,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (err?: Error): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      if (err) reject(err);
+      else resolve();
+    };
+
+    const onAbort = (): void => {
+      req.destroy();
+      finish();
+    };
+
+    const req = http.request(
+      {
+        socketPath: cfg.dockerSocket,
+        path: dockerEventStreamPath(),
+        method: "GET",
+        headers: { Host: "docker" },
+      },
+      (res) => {
+        const status = res.statusCode ?? 0;
+        if (status < 200 || status >= 300) {
+          finish(new Error(`docker API GET /events returned ${status}`));
+          res.resume();
+          return;
+        }
+        onStreamConnected();
+
+        let buffer = "";
+        res.setEncoding("utf-8");
+
+        res.on("data", (chunk: string) => {
+          if (signal.aborted) return;
+
+          buffer += chunk;
+          for (;;) {
+            const idx = buffer.indexOf("\n");
+            if (idx < 0) break;
+
+            const line = buffer.slice(0, idx).trim();
+            buffer = buffer.slice(idx + 1);
+            if (!line) continue;
+
+            try {
+              const event = JSON.parse(line) as DockerEvent;
+              if (isDockerEventRelevant(event)) {
+                onRelevantEvent(event);
+              }
+            } catch {
+              // Ignore malformed event payloads and keep the stream open.
+            }
+          }
+        });
+
+        res.on("end", () => finish());
+        res.on("error", (error) => finish(error as Error));
+
+        if (signal.aborted) {
+          req.destroy();
+          finish();
+        }
+      },
+    );
+
+    signal.addEventListener("abort", onAbort, { once: true });
+    req.on("error", (error) => finish(error as Error));
+    req.end();
+  });
+}
+
 async function consulRequest(cfg: Config, method: string, requestPath: string, body?: unknown): Promise<Response> {
   const url = `${cfg.consulHTTPAddr.replace(/\/$/, "")}${requestPath}`;
   const headers: Record<string, string> = body === undefined ? {} : { "Content-Type": "application/json" };
@@ -235,6 +301,31 @@ async function consulRequest(cfg: Config, method: string, requestPath: string, b
   return response;
 }
 
+async function consulLeader(cfg: Config): Promise<string> {
+  const response = await consulRequest(cfg, "GET", "/v1/status/leader");
+  const raw = (await response.text()).trim();
+  return raw.replace(/^"/, "").replace(/"$/, "").trim();
+}
+
+async function waitForConsulReady(cfg: Config, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = "consul leader not available";
+
+  while (Date.now() < deadline) {
+    try {
+      const leader = await consulLeader(cfg);
+      if (leader) return;
+      lastError = "consul leader is empty";
+    } catch (error) {
+      lastError = (error as Error).message;
+    }
+
+    await sleep(1000);
+  }
+
+  throw new Error(`consul not ready after ${timeoutMs}ms: ${lastError}`);
+}
+
 async function registerService(cfg: Config, reg: ConsulServiceRegistration): Promise<void> {
   await consulRequest(cfg, "PUT", "/v1/agent/service/register", reg);
 }
@@ -248,39 +339,22 @@ async function listAgentServices(cfg: Config): Promise<Record<string, AgentServi
   return ((await response.json()) as Record<string, AgentService>) ?? {};
 }
 
-async function registerOwnerHeartbeatService(cfg: Config, serviceID: string): Promise<void> {
-  await registerService(cfg, {
-    ID: serviceID,
-    Name: ownerHeartbeatService,
-    Meta: {
-      [managedByMetaKey]: managedByMetaValue,
-      [ownerIDMetaKey]: cfg.ownerID,
-      kind: "owner-heartbeat",
-    },
-    Check: {
-      Name: "owner heartbeat",
-      TTL: durationToConsulString(cfg.ownerHeartbeatTTLMs),
-      DeregisterCriticalServiceAfter: durationToConsulString(cfg.ownerDownGraceMs),
-    },
+async function listCatalogServices(cfg: Config): Promise<Record<string, string[]>> {
+  const response = await consulRequest(cfg, "GET", "/v1/catalog/services");
+  return ((await response.json()) as Record<string, string[]>) ?? {};
+}
+
+async function listCatalogServiceInstances(cfg: Config, serviceName: string): Promise<CatalogInstance[]> {
+  const response = await consulRequest(cfg, "GET", `/v1/catalog/service/${encodeURIComponent(serviceName)}`);
+  const parsed = (await response.json()) as CatalogInstance[];
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+async function deregisterCatalogService(cfg: Config, node: string, serviceID: string): Promise<void> {
+  await consulRequest(cfg, "PUT", "/v1/catalog/deregister", {
+    Node: node,
+    ServiceID: serviceID,
   });
-}
-
-async function passOwnerHeartbeat(cfg: Config, serviceID: string): Promise<void> {
-  await consulRequest(cfg, "PUT", `/v1/agent/check/pass/${encodeURIComponent(`service:${serviceID}`)}`);
-}
-
-async function passOwnerHeartbeatWithAutoRecover(cfg: Config, serviceID: string): Promise<void> {
-  try {
-    await passOwnerHeartbeat(cfg, serviceID);
-    return;
-  } catch (error) {
-    const status = (error as Error & { status?: number }).status;
-    if (status !== 404) throw error;
-  }
-
-  console.log(`owner heartbeat check missing for service_id=${serviceID}; re-registering heartbeat service`);
-  await registerOwnerHeartbeatService(cfg, serviceID);
-  await passOwnerHeartbeat(cfg, serviceID);
 }
 
 function shortID(raw: string): string {
@@ -345,11 +419,10 @@ function servicePort(cfg: Config, labels: Record<string, string>, ports: DockerP
 }
 
 function traefikTags(labels: Record<string, string>): string[] {
-  const tags = Object.entries(labels)
+  return Object.entries(labels)
     .filter(([key]) => key.startsWith("traefik."))
     .map(([key, value]) => `${key}=${value}`)
     .sort();
-  return tags;
 }
 
 function buildDockerRegistration(cfg: Config, container: DockerContainer): ConsulServiceRegistration | null {
@@ -382,6 +455,7 @@ function buildDockerRegistration(cfg: Config, container: DockerContainer): Consu
     Meta: {
       [managedByMetaKey]: managedByMetaValue,
       [ownerIDMetaKey]: cfg.ownerID,
+      source: sourceModeDocker,
     },
   };
 }
@@ -478,7 +552,9 @@ async function loadFileModeDesiredServices(cfg: Config): Promise<{ desired: Map<
       }
 
       const normalizedKey = normalizeFileServiceKey(key);
-      const id = (svc.id?.trim() ?? "") || (normalizedKey ? `${cfg.serviceIDPrefix}${normalizedKey}` : deriveFileServiceID(cfg, filePath, key, svc));
+      const id =
+        (svc.id?.trim() ?? "") ||
+        (normalizedKey ? `${cfg.serviceIDPrefix}${normalizedKey}` : deriveFileServiceID(cfg, filePath, key, svc));
       const name = (svc.name?.trim() ?? "") || key.trim() || cfg.defaultServiceName;
 
       const meta: Record<string, string> = {
@@ -517,29 +593,85 @@ async function loadFileModeDesiredServices(cfg: Config): Promise<{ desired: Map<
   return { desired, configured };
 }
 
-async function computeFileSourceSignature(sourcePath: string): Promise<string> {
-  const parts: string[] = [];
+function isOwnedManagedService(meta: Record<string, string> | undefined, ownerID: string): boolean {
+  if (!meta) return false;
+  if ((meta[managedByMetaKey] ?? "").trim() !== managedByMetaValue) return false;
+  return (meta[ownerIDMetaKey] ?? "").trim() === ownerID;
+}
+
+async function cleanupOwnedServicesOnStartup(cfg: Config): Promise<void> {
+  let removedAgent = 0;
+  let removedCatalog = 0;
 
   try {
-    const stat = await fs.stat(sourcePath);
-    if (!stat.isDirectory()) {
-      const fileStat = await fs.stat(sourcePath);
-      return `${sourcePath}:${fileStat.size}:${fileStat.mtimeMs}`;
+    const services = await listAgentServices(cfg);
+    for (const [id, svc] of Object.entries(services)) {
+      if (!isOwnedManagedService(svc.Meta, cfg.ownerID)) continue;
+      try {
+        await deregisterService(cfg, id);
+        removedAgent += 1;
+      } catch (error) {
+        console.log(`startup cleanup agent deregister failed for ${id}: ${(error as Error).message}`);
+      }
     }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return "missing";
+    console.log(`startup cleanup agent scan skipped: ${(error as Error).message}`);
+  }
+
+  try {
+    const byService = await listCatalogServices(cfg);
+    const seen = new Set<string>();
+
+    for (const serviceName of Object.keys(byService).sort()) {
+      const instances = await listCatalogServiceInstances(cfg, serviceName);
+      for (const instance of instances) {
+        if (!isOwnedManagedService(instance.ServiceMeta, cfg.ownerID)) continue;
+
+        const node = (instance.Node ?? "").trim();
+        const serviceID = (instance.ServiceID ?? "").trim();
+        if (!node || !serviceID) continue;
+
+        const key = `${node}/${serviceID}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        try {
+          await deregisterCatalogService(cfg, node, serviceID);
+          removedCatalog += 1;
+        } catch (error) {
+          console.log(`startup cleanup catalog deregister failed for ${key}: ${(error as Error).message}`);
+        }
+      }
     }
-    throw error;
+  } catch (error) {
+    console.log(`startup cleanup catalog scan skipped: ${(error as Error).message}`);
   }
 
-  const files = await collectFileSourcePaths(sourcePath);
-  for (const filePath of files) {
-    const fileStat = await fs.stat(filePath);
-    parts.push(`${filePath}:${fileStat.size}:${fileStat.mtimeMs}`);
+  console.log(`startup cleanup complete: owner_id=${cfg.ownerID} removed_agent=${removedAgent} removed_catalog=${removedCatalog}`);
+}
+
+async function pruneUnexpectedOwnedAgentServices(
+  cfg: Config,
+  desired: Map<string, ConsulServiceRegistration>,
+  managed: Set<string>,
+): Promise<number> {
+  let removed = 0;
+  const services = await listAgentServices(cfg);
+
+  for (const [id, svc] of Object.entries(services)) {
+    if (desired.has(id)) continue;
+    if (!isOwnedManagedService(svc.Meta, cfg.ownerID)) continue;
+
+    try {
+      await deregisterService(cfg, id);
+      managed.delete(id);
+      removed += 1;
+    } catch (error) {
+      console.log(`deregister stale ${id} failed: ${(error as Error).message}`);
+    }
   }
 
-  return parts.join("|");
+  return removed;
 }
 
 async function applyDesiredState(
@@ -548,48 +680,52 @@ async function applyDesiredState(
   desired: Map<string, ConsulServiceRegistration>,
   sourceSummary: string,
 ): Promise<void> {
+  let upserted = 0;
+
   for (const reg of desired.values()) {
     try {
       await registerService(cfg, reg);
       managed.add(reg.ID);
+      upserted += 1;
     } catch (error) {
       console.log(`register ${reg.ID} failed: ${(error as Error).message}`);
     }
   }
 
+  let removedNoLongerDesired = 0;
+  let agentServices: Record<string, AgentService> = {};
+  try {
+    agentServices = await listAgentServices(cfg);
+  } catch (error) {
+    console.log(`agent service snapshot for managed cleanup failed: ${(error as Error).message}`);
+  }
+
   for (const id of [...managed]) {
     if (desired.has(id)) continue;
+    if (!isOwnedManagedService(agentServices[id]?.Meta, cfg.ownerID)) {
+      managed.delete(id);
+      continue;
+    }
+
     try {
       await deregisterService(cfg, id);
       managed.delete(id);
+      removedNoLongerDesired += 1;
     } catch (error) {
       console.log(`deregister ${id} failed: ${(error as Error).message}`);
     }
   }
 
-  let recovered = 0;
+  let removedUnexpected = 0;
   try {
-    const services = await listAgentServices(cfg);
-    for (const [id, svc] of Object.entries(services)) {
-      if (desired.has(id)) continue;
-      const meta = svc.Meta ?? {};
-      if (meta[managedByMetaKey] !== managedByMetaValue) continue;
-      if ((meta.kind ?? "").trim() === "owner-heartbeat") continue;
-      if ((meta[ownerIDMetaKey] ?? "").trim() !== cfg.ownerID) continue;
-
-      try {
-        await deregisterService(cfg, id);
-        managed.delete(id);
-        recovered += 1;
-      } catch (error) {
-        console.log(`reconcile stale ${id} failed: ${(error as Error).message}`);
-      }
-    }
+    removedUnexpected = await pruneUnexpectedOwnedAgentServices(cfg, desired, managed);
   } catch (error) {
-    console.log(`owner reconciliation skipped: ${(error as Error).message}`);
+    console.log(`owned-service prune skipped: ${(error as Error).message}`);
   }
 
-  console.log(`sync complete: ${sourceSummary} registered_services=${desired.size} recovered_stale_services=${recovered}`);
+  console.log(
+    `sync complete: ${sourceSummary} desired=${desired.size} upserted=${upserted} removed_not_desired=${removedNoLongerDesired} removed_unexpected_owned=${removedUnexpected}`,
+  );
 }
 
 async function syncDockerModeOnce(cfg: Config, managed: Set<string>): Promise<void> {
@@ -601,7 +737,7 @@ async function syncDockerModeOnce(cfg: Config, managed: Set<string>): Promise<vo
     if (reg) desired.set(reg.ID, reg);
   }
 
-  await applyDesiredState(cfg, managed, desired, `running_containers=${containers.length}`);
+  await applyDesiredState(cfg, managed, desired, `source=docker running_containers=${containers.length}`);
 }
 
 async function syncFileModeOnce(cfg: Config, managed: Set<string>): Promise<void> {
@@ -610,123 +746,109 @@ async function syncFileModeOnce(cfg: Config, managed: Set<string>): Promise<void
     cfg,
     managed,
     loaded.desired,
-    `configured_services=${loaded.configured} source_path=${cfg.fileSourcePath}`,
+    `source=file configured_services=${loaded.configured} source_path=${cfg.fileSourcePath}`,
   );
 }
 
-async function listOwnerChecks(cfg: Config): Promise<OwnerCheck[]> {
-  const response = await consulRequest(cfg, "GET", `/v1/health/checks/${encodeURIComponent(ownerHeartbeatService)}`);
-  const parsed = (await response.json()) as OwnerCheck[];
-  return Array.isArray(parsed) ? parsed : [];
-}
+function isFileSourceEventRelevant(sourcePath: string, eventPath: string): boolean {
+  const cleanSource = path.resolve(sourcePath);
+  const cleanEvent = path.resolve(eventPath);
+  if (cleanSource === cleanEvent) return true;
 
-async function listCatalogServices(cfg: Config): Promise<Record<string, string[]>> {
-  const response = await consulRequest(cfg, "GET", "/v1/catalog/services");
-  return ((await response.json()) as Record<string, string[]>) ?? {};
-}
-
-async function listCatalogServiceInstances(cfg: Config, serviceName: string): Promise<CatalogInstance[]> {
-  const response = await consulRequest(cfg, "GET", `/v1/catalog/service/${encodeURIComponent(serviceName)}`);
-  const parsed = (await response.json()) as CatalogInstance[];
-  return Array.isArray(parsed) ? parsed : [];
-}
-
-async function deregisterCatalogService(cfg: Config, node: string, serviceID: string): Promise<void> {
-  await consulRequest(cfg, "PUT", "/v1/catalog/deregister", {
-    Node: node,
-    ServiceID: serviceID,
-  });
-}
-
-function ownerStatusByNode(checks: OwnerCheck[]): Map<string, Map<string, string>> {
-  const out = new Map<string, Map<string, string>>();
-
-  for (const check of checks) {
-    const serviceID = (check.ServiceID ?? "").trim();
-    const node = (check.Node ?? "").trim();
-    if (!node || !serviceID.startsWith(ownerHeartbeatIDPrefix)) continue;
-
-    const owner = serviceID.slice(ownerHeartbeatIDPrefix.length).trim();
-    if (!owner) continue;
-
-    if (!out.has(owner)) out.set(owner, new Map<string, string>());
-    out.get(owner)?.set(node, (check.Status ?? "").trim());
+  if (isSupportedFileSourcePath(cleanSource)) {
+    return cleanEvent === cleanSource;
   }
 
-  return out;
+  return path.dirname(cleanEvent) === cleanSource && isSupportedFileSourcePath(cleanEvent);
 }
 
-async function sweepStaleServices(cfg: Config, gcSeen: Map<string, number>): Promise<void> {
-  const checks = await listOwnerChecks(cfg);
-  const ownerByNode = ownerStatusByNode(checks);
+function createSyncRunner(syncFn: (reason: string) => Promise<void>): {
+  runNow: (reason: string) => Promise<void>;
+  trigger: (reason: string) => void;
+} {
+  let running = false;
+  let pending = false;
+  let pendingReason = "";
 
-  const catalogServices = await listCatalogServices(cfg);
-  const now = Date.now();
-  let removed = 0;
-
-  const candidates: Array<{ key: string; node: string; serviceID: string; reason: string; graceMs: number }> = [];
-
-  for (const serviceName of Object.keys(catalogServices).sort()) {
-    const instances = await listCatalogServiceInstances(cfg, serviceName);
-
-    for (const instance of instances) {
-      const meta = instance.ServiceMeta ?? {};
-      if (meta[managedByMetaKey] !== managedByMetaValue) continue;
-      if ((meta.kind ?? "").trim() === "owner-heartbeat") continue;
-
-      const node = (instance.Node ?? "").trim();
-      const serviceID = (instance.ServiceID ?? "").trim();
-      if (!node || !serviceID) continue;
-
-      const owner = (meta[ownerIDMetaKey] ?? "").trim();
-      if (!owner) {
-        candidates.push({
-          key: `${node}/${serviceID}`,
-          node,
-          serviceID,
-          reason: "missing owner-id",
-          graceMs: cfg.orphanGraceMs,
-        });
-        continue;
-      }
-
-      const statusOnNode = ownerByNode.get(owner)?.get(node) ?? "";
-      if (statusOnNode.toLowerCase() === "passing") {
-        gcSeen.delete(`${node}/${serviceID}`);
-        continue;
-      }
-
-      candidates.push({
-        key: `${node}/${serviceID}`,
-        node,
-        serviceID,
-        reason: statusOnNode ? "owner heartbeat missing on node" : "owner heartbeat missing",
-        graceMs: cfg.ownerDownGraceMs,
-      });
+  const runInternal = async (reason: string): Promise<void> => {
+    if (running) {
+      pending = true;
+      pendingReason = pendingReason ? `${pendingReason},${reason}` : reason;
+      return;
     }
+
+    running = true;
+    let currentReason = reason;
+
+    for (;;) {
+      try {
+        await syncFn(currentReason);
+      } catch (error) {
+        console.log(`sync failed (${currentReason}): ${(error as Error).message}`);
+      }
+
+      if (!pending) break;
+      pending = false;
+      currentReason = pendingReason || "queued-trigger";
+      pendingReason = "";
+    }
+
+    running = false;
+  };
+
+  return {
+    runNow: runInternal,
+    trigger: (reason: string) => {
+      void runInternal(reason);
+    },
+  };
+}
+
+async function setupFileWatchers(cfg: Config, onRelevantChange: (eventPath: string) => void): Promise<() => void> {
+  const targets = new Set<string>([path.dirname(cfg.fileSourcePath)]);
+
+  try {
+    const stat = await fs.stat(cfg.fileSourcePath);
+    if (stat.isDirectory()) {
+      targets.add(cfg.fileSourcePath);
+    }
+  } catch {
+    // Rely on parent directory watch if source path is missing or inaccessible.
   }
 
-  for (const candidate of candidates) {
-    const firstSeen = gcSeen.get(candidate.key) ?? now;
-    gcSeen.set(candidate.key, firstSeen);
-
-    if (now-firstSeen < candidate.graceMs) continue;
-
+  const watchers: ReturnType<typeof watch>[] = [];
+  for (const target of [...targets]) {
     try {
-      await deregisterCatalogService(cfg, candidate.node, candidate.serviceID);
-      gcSeen.delete(candidate.key);
-      removed += 1;
-      console.log(
-        `gc deregistered stale service service_id=${candidate.serviceID} node=${candidate.node} reason=${candidate.reason}`,
-      );
+      const watcher = watch(target, { persistent: true }, (_eventType, filename) => {
+        const fullPath = filename ? path.join(target, filename.toString()) : target;
+        if (isFileSourceEventRelevant(cfg.fileSourcePath, fullPath)) {
+          onRelevantChange(fullPath);
+        }
+      });
+      watchers.push(watcher);
     } catch (error) {
-      console.log(
-        `gc deregister failed service_id=${candidate.serviceID} node=${candidate.node} reason=${candidate.reason} err=${(error as Error).message}`,
-      );
+      console.log(`file watch skipped for ${target}: ${(error as Error).message}`);
     }
   }
 
-  console.log(`gc sweep complete: alive_owners=${ownerByNode.size} removed=${removed}`);
+  return () => {
+    for (const watcher of watchers) {
+      watcher.close();
+    }
+  };
+}
+
+function installSignalHandler(controller: AbortController): void {
+  const stop = (): void => controller.abort();
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+}
+
+async function waitForAbort(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return;
+  await new Promise<void>((resolve) => {
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
 }
 
 async function run(): Promise<void> {
@@ -734,7 +856,7 @@ async function run(): Promise<void> {
   await validateConfig(cfg);
 
   console.log(
-    `starting event loop: source_mode=${cfg.sourceMode} consul=${cfg.consulHTTPAddr} resync_interval=${durationToConsulString(cfg.resyncIntervalMs)} gc_interval=${durationToConsulString(cfg.gcIntervalMs)} require_traefik_enable=${cfg.requireTraefikEnable} owner_id=${cfg.ownerID}`,
+    `starting: source_mode=${cfg.sourceMode} consul=${cfg.consulHTTPAddr} require_traefik_enable=${cfg.requireTraefikEnable} owner_id=${cfg.ownerID}`,
   );
 
   if (cfg.sourceMode === sourceModeDocker) {
@@ -743,10 +865,14 @@ async function run(): Promise<void> {
     console.log(`file mode configured: file_source_path=${cfg.fileSourcePath}`);
   }
 
-  const managed = new Set<string>();
-  const gcSeen = new Map<string, number>();
+  console.log("waiting for consul leader availability");
+  await waitForConsulReady(cfg, 90_000);
+  console.log("consul is ready");
 
-  const doSync = async (): Promise<void> => {
+  const managed = new Set<string>();
+  await cleanupOwnedServicesOnStartup(cfg);
+
+  const doSync = async (_reason: string): Promise<void> => {
     if (cfg.sourceMode === sourceModeDocker) {
       await syncDockerModeOnce(cfg, managed);
     } else {
@@ -754,146 +880,36 @@ async function run(): Promise<void> {
     }
   };
 
-  try {
-    await doSync();
-  } catch (error) {
-    console.log(`initial sync failed: ${(error as Error).message}`);
-  }
+  const syncRunner = createSyncRunner(doSync);
+  await syncRunner.runNow("startup");
 
-  const ownerServiceID = `${ownerHeartbeatIDPrefix}${cfg.ownerID}`;
-  try {
-    await registerOwnerHeartbeatService(cfg, ownerServiceID);
-  } catch (error) {
-    console.log(`owner heartbeat registration failed: ${(error as Error).message}`);
-  }
-  try {
-    await passOwnerHeartbeatWithAutoRecover(cfg, ownerServiceID);
-  } catch (error) {
-    console.log(`initial owner heartbeat pass failed: ${(error as Error).message}`);
-  }
+  const controller = new AbortController();
+  installSignalHandler(controller);
 
-  let stopped = false;
-  const stop = (): void => {
-    stopped = true;
-  };
-  process.on("SIGINT", stop);
-  process.on("SIGTERM", stop);
-
-  let fileWatchTrigger = 0;
-  let closeWatcher: (() => void) | null = null;
-
-  if (cfg.sourceMode === sourceModeFile) {
-    const watchTargets = new Set<string>();
-    watchTargets.add(path.dirname(cfg.fileSourcePath));
-    try {
-      const stat = await fs.stat(cfg.fileSourcePath);
-      if (stat.isDirectory()) {
-        watchTargets.add(cfg.fileSourcePath);
-      }
-    } catch {
-      // ignore ENOENT and rely on parent dir watch.
-    }
-
-    const watchers = [...watchTargets].map((target) =>
-      watch(target, { persistent: true }, (_eventType, filename) => {
-        const fullPath = filename ? path.join(target, filename.toString()) : target;
-        if (isFileSourceEventRelevant(cfg.fileSourcePath, fullPath)) {
-          fileWatchTrigger = Date.now();
-        }
-      }),
+  if (cfg.sourceMode === sourceModeDocker) {
+    await watchDockerEvents(
+      cfg,
+      (event) => {
+        const action = dockerEventAction(event);
+        const id = shortID((event.id ?? "").trim());
+        syncRunner.trigger(`docker-event:${action}:${id}`);
+      },
+      () => {
+        syncRunner.trigger("docker-events-connected");
+      },
+      controller.signal,
     );
+  } else {
+    const closeWatchers = await setupFileWatchers(cfg, (eventPath) => {
+      syncRunner.trigger(`file-change:${eventPath}`);
+    });
+    await syncRunner.runNow("file-watchers-attached");
 
-    closeWatcher = () => {
-      for (const watcher of watchers) watcher.close();
-    };
+    await waitForAbort(controller.signal);
+    closeWatchers();
   }
 
-  let lastResync = Date.now();
-  let lastOwnerPass = Date.now();
-  let lastGC = Date.now();
-  let lastFileSync = 0;
-  let lastFileProbe = 0;
-  let lastFileSignature = cfg.sourceMode === sourceModeFile ? await computeFileSourceSignature(cfg.fileSourcePath) : "";
-
-  while (!stopped) {
-    const now = Date.now();
-
-    if (cfg.sourceMode === sourceModeFile && now - lastFileProbe >= 1000) {
-      try {
-        const signature = await computeFileSourceSignature(cfg.fileSourcePath);
-        if (signature !== lastFileSignature) {
-          fileWatchTrigger = Date.now();
-          lastFileSignature = signature;
-        }
-      } catch (error) {
-        console.log(`file source probe failed: ${(error as Error).message}`);
-      }
-      lastFileProbe = Date.now();
-    }
-
-    if (cfg.sourceMode === sourceModeFile && fileWatchTrigger > lastFileSync) {
-      try {
-        await doSync();
-      } catch (error) {
-        console.log(`sync after file change failed: ${(error as Error).message}`);
-      }
-      lastFileSync = Date.now();
-      lastResync = Date.now();
-      try {
-        lastFileSignature = await computeFileSourceSignature(cfg.fileSourcePath);
-      } catch {
-        // Ignore transient read errors after sync; next probe will retry.
-      }
-    }
-
-    if (now - lastResync >= cfg.resyncIntervalMs) {
-      try {
-        await doSync();
-      } catch (error) {
-        console.log(`periodic resync failed: ${(error as Error).message}`);
-      }
-      lastResync = Date.now();
-    }
-
-    if (now - lastOwnerPass >= cfg.ownerHeartbeatPassMs) {
-      try {
-        await passOwnerHeartbeatWithAutoRecover(cfg, ownerServiceID);
-      } catch (error) {
-        console.log(`owner heartbeat pass failed: ${(error as Error).message}`);
-      }
-      lastOwnerPass = Date.now();
-    }
-
-    if (now - lastGC >= cfg.gcIntervalMs) {
-      try {
-        await sweepStaleServices(cfg, gcSeen);
-      } catch (error) {
-        console.log(`gc sweep failed: ${(error as Error).message}`);
-      }
-      lastGC = Date.now();
-    }
-
-    await sleep(200);
-  }
-
-  closeWatcher?.();
   console.log("shutdown signal received; leaving current Consul registrations unchanged");
-}
-
-function isFileSourceEventRelevant(sourcePath: string, eventPath: string): boolean {
-  const cleanSource = path.resolve(sourcePath);
-  const cleanEvent = path.resolve(eventPath);
-  if (cleanSource === cleanEvent) return true;
-
-  if (isSupportedFileSourcePath(cleanSource) && cleanEvent === cleanSource) {
-    return true;
-  }
-
-  if (!isSupportedFileSourcePath(cleanSource)) {
-    return path.dirname(cleanEvent) === cleanSource && isSupportedFileSourcePath(cleanEvent);
-  }
-
-  return false;
 }
 
 run().catch((error) => {

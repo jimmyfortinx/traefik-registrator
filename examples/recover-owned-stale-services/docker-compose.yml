@@ -42,7 +42,7 @@ services:
                 time.sleep(1)
             raise RuntimeError("consul did not become ready")
 
-        def register_stale(service_id):
+        def register_stale(service_id, owner_id):
             payload = {
                 "ID": service_id,
                 "Name": "whoami",
@@ -50,7 +50,7 @@ services:
                 "Port": 8080,
                 "Meta": {
                     "managed-by": "traefik-registrator",
-                    "owner-id": "live-owner",
+                    "owner-id": owner_id,
                 },
             }
             req = urllib.request.Request(
@@ -63,9 +63,37 @@ services:
                 if resp.status != 200:
                     raise RuntimeError(f"seed register failed for {service_id}: status={resp.status}")
 
+        def register_catalog(node, service_id, owner_id):
+            payload = {
+                "Node": node,
+                "Address": "10.250.0.10",
+                "Service": {
+                    "ID": service_id,
+                    "Service": "whoami",
+                    "Address": "10.250.1.11",
+                    "Port": 8081,
+                    "Meta": {
+                        "managed-by": "traefik-registrator",
+                        "owner-id": owner_id,
+                    },
+                },
+            }
+            req = urllib.request.Request(
+                consul + "/v1/catalog/register",
+                data=json.dumps(payload).encode("utf-8"),
+                method="PUT",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"catalog seed failed for {service_id}: status={resp.status}")
+
         wait_for_consul()
-        register_stale("stale-whoami-a")
-        register_stale("stale-whoami-b")
+        register_stale("stale-whoami-a", "live-owner")
+        register_stale("stale-whoami-b", "live-owner")
+        register_stale("stale-foreign-owner", "foreign-owner")
+        register_catalog("seed-node-a", "stale-catalog-live-owner", "live-owner")
+        register_catalog("seed-node-b", "stale-catalog-foreign-owner", "foreign-owner")
         print("seeded stale owner-bound services")
         while True:
             time.sleep(60)
@@ -98,12 +126,7 @@ services:
         condition: service_healthy
     environment:
       CONSUL_HTTP_ADDR: http://consul:8500
-      POLL_INTERVAL: 2s
-      GC_INTERVAL: 2s
       OWNER_ID: live-owner
-      ORPHAN_GRACE_PERIOD: 2m
-      OWNER_DOWN_GRACE_PERIOD: 2m
       SERVICE_ID_PREFIX: docker-
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-
