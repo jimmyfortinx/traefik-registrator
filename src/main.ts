@@ -228,7 +228,9 @@ async function consulRequest(cfg: Config, method: string, requestPath: string, b
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`consul API ${method} ${requestPath} returned ${response.status}: ${text}`);
+    const error = new Error(`consul API ${method} ${requestPath} returned ${response.status}: ${text}`);
+    (error as Error & { status?: number }).status = response.status;
+    throw error;
   }
   return response;
 }
@@ -265,6 +267,20 @@ async function registerOwnerHeartbeatService(cfg: Config, serviceID: string): Pr
 
 async function passOwnerHeartbeat(cfg: Config, serviceID: string): Promise<void> {
   await consulRequest(cfg, "PUT", `/v1/agent/check/pass/${encodeURIComponent(`service:${serviceID}`)}`);
+}
+
+async function passOwnerHeartbeatWithAutoRecover(cfg: Config, serviceID: string): Promise<void> {
+  try {
+    await passOwnerHeartbeat(cfg, serviceID);
+    return;
+  } catch (error) {
+    const status = (error as Error & { status?: number }).status;
+    if (status !== 404) throw error;
+  }
+
+  console.log(`owner heartbeat check missing for service_id=${serviceID}; re-registering heartbeat service`);
+  await registerOwnerHeartbeatService(cfg, serviceID);
+  await passOwnerHeartbeat(cfg, serviceID);
 }
 
 function shortID(raw: string): string {
@@ -751,7 +767,7 @@ async function run(): Promise<void> {
     console.log(`owner heartbeat registration failed: ${(error as Error).message}`);
   }
   try {
-    await passOwnerHeartbeat(cfg, ownerServiceID);
+    await passOwnerHeartbeatWithAutoRecover(cfg, ownerServiceID);
   } catch (error) {
     console.log(`initial owner heartbeat pass failed: ${(error as Error).message}`);
   }
@@ -841,7 +857,7 @@ async function run(): Promise<void> {
 
     if (now - lastOwnerPass >= cfg.ownerHeartbeatPassMs) {
       try {
-        await passOwnerHeartbeat(cfg, ownerServiceID);
+        await passOwnerHeartbeatWithAutoRecover(cfg, ownerServiceID);
       } catch (error) {
         console.log(`owner heartbeat pass failed: ${(error as Error).message}`);
       }
