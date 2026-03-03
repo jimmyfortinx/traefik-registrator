@@ -21,10 +21,6 @@ services:
     environment:
       CONSUL_HTTP_ADDR: http://tasks.consul:8500
       OWNER_ID: "{{.Node.Hostname}}"
-      POLL_INTERVAL: 5s
-      GC_INTERVAL: 5s
-      ORPHAN_GRACE_PERIOD: 20s
-      OWNER_DOWN_GRACE_PERIOD: 20s
       SERVICE_ID_PREFIX: docker-
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -42,10 +38,6 @@ services:
       CONSUL_HTTP_ADDR: http://tasks.consul:8500
       OWNER_ID: file-worker2
       SERVICE_ID_PREFIX: file-
-      POLL_INTERVAL: 5s
-      GC_INTERVAL: 5s
-      ORPHAN_GRACE_PERIOD: 20s
-      OWNER_DOWN_GRACE_PERIOD: 20s
     configs:
       - source: worker2_file_services
         target: /etc/traefik-registrator/services.d/worker2.yml

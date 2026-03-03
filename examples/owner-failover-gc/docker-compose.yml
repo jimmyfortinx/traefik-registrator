@@ -23,13 +23,7 @@ services:
         condition: service_healthy
     environment:
       CONSUL_HTTP_ADDR: http://consul:8500
-      POLL_INTERVAL: 2s
-      GC_INTERVAL: 2s
       OWNER_ID: owner-a
-      OWNER_HEARTBEAT_TTL: 6s
-      OWNER_HEARTBEAT_PASS_INTERVAL: 2s
-      ORPHAN_GRACE_PERIOD: 4s
-      OWNER_DOWN_GRACE_PERIOD: 4s
       SERVICE_ID_PREFIX: owner-a-
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -43,13 +37,7 @@ services:
         condition: service_healthy
     environment:
       CONSUL_HTTP_ADDR: http://consul:8500
-      POLL_INTERVAL: 2s
-      GC_INTERVAL: 2s
       OWNER_ID: owner-b
-      OWNER_HEARTBEAT_TTL: 6s
-      OWNER_HEARTBEAT_PASS_INTERVAL: 2s
-      ORPHAN_GRACE_PERIOD: 4s
-      OWNER_DOWN_GRACE_PERIOD: 4s
       SERVICE_ID_PREFIX: owner-b-
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

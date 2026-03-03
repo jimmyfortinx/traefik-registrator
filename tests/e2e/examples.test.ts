@@ -2,13 +2,10 @@ import { beforeAll, describe } from "bun:test";
 import {
   compose,
   consulJson,
-  containerState,
   managedServices,
-  ownerStates,
   registerScenario,
   run,
   waitUntil,
-  whoamiOwners,
 } from "./test-utils";
 
 describe("compose examples", () => {
@@ -20,13 +17,8 @@ describe("compose examples", () => {
     await waitUntil("basic service registration", 90_000, async () => {
       const services = (await consulJson(project, composeFile, "/v1/agent/services")) as Record<string, any>;
       const managed = managedServices(services);
-      const ownerHeartbeat = Object.values(services).some((svc: any) => {
-        const meta = svc.Meta ?? {};
-        return meta["managed-by"] === "traefik-registrator" && meta.kind === "owner-heartbeat";
-      });
-
       const whoami = managed.find((svc: any) => svc.Service === "whoami");
-      if (!whoami || !ownerHeartbeat) return "missing whoami service or owner heartbeat";
+      if (!whoami) return "missing whoami service";
 
       const tags = new Set(whoami.Tags ?? []);
       const expected = [
@@ -43,6 +35,22 @@ describe("compose examples", () => {
 
       return ok || "whoami registration is not fully reconciled";
     });
+
+    compose(project, composeFile, ["stop", "whoami"]);
+    await waitUntil("whoami deregistration after stop event", 45_000, async () => {
+      const services = (await consulJson(project, composeFile, "/v1/agent/services")) as Record<string, any>;
+      const stillPresent = managedServices(services).some((svc: any) => svc.Service === "whoami");
+      return stillPresent ? "whoami still registered after stop" : true;
+    });
+
+    compose(project, composeFile, ["start", "whoami"]);
+    await waitUntil("whoami re-registration after start event", 45_000, async () => {
+      const services = (await consulJson(project, composeFile, "/v1/agent/services")) as Record<string, any>;
+      const present = managedServices(services).some(
+        (svc: any) => svc.Service === "whoami" && svc.Meta?.["owner-id"] === "example-basic",
+      );
+      return present || "whoami not re-registered after start";
+    });
   });
 
   registerScenario("custom-label-overrides", async (project, composeFile) => {
@@ -54,24 +62,6 @@ describe("compose examples", () => {
 
       const ok = svc.Address === "10.9.8.7" && svc.Port === 9090 && svc.Meta?.["owner-id"] === "example-custom";
       return ok || "payments-api has unexpected address/port/owner";
-    });
-  });
-
-  registerScenario("gc-stale-services", async (project, composeFile) => {
-    await waitUntil("seeded stale services", 30_000, async () => {
-      const orphan = (await consulJson(project, composeFile, "/v1/catalog/service/orphan-app")) as any[];
-      const dead = (await consulJson(project, composeFile, "/v1/catalog/service/dead-owner-app")) as any[];
-      const hasOrphan = orphan.some((item) => item.ServiceID === "seed-orphan");
-      const hasDead = dead.some((item) => item.ServiceID === "seed-dead-owner");
-      return hasOrphan && hasDead ? true : "seeded stale instances not visible yet";
-    });
-
-    await waitUntil("stale services garbage collection", 90_000, async () => {
-      const orphan = (await consulJson(project, composeFile, "/v1/catalog/service/orphan-app")) as any[];
-      const dead = (await consulJson(project, composeFile, "/v1/catalog/service/dead-owner-app")) as any[];
-      const hasOrphan = orphan.some((item) => item.ServiceID === "seed-orphan");
-      const hasDead = dead.some((item) => item.ServiceID === "seed-dead-owner");
-      return !hasOrphan && !hasDead ? true : "stale services still present";
     });
   });
 
@@ -150,53 +140,52 @@ describe("compose examples", () => {
 
       return updated || "updated route tag not observed yet";
     });
-  });
 
-  registerScenario("owner-failover-gc", async (project, composeFile) => {
-    await waitUntil("both owners to register", 90_000, async () => {
-      const owners = await whoamiOwners(project, composeFile);
-      const states = await ownerStates(project, composeFile);
-      const ready =
-        Boolean(owners["owner-a"]?.length) &&
-        Boolean(owners["owner-b"]?.length) &&
-        states["owner-a"] === "passing" &&
-        states["owner-b"] === "passing";
+    compose(project, composeFile, [
+      "exec",
+      "-T",
+      "seed-file-config",
+      "sh",
+      "-ec",
+      "rm -f /fixtures/services.d/routes.yml",
+    ]);
 
-      return ready || "owner services/heartbeats not fully ready";
+    await waitUntil("file deletion propagation", 45_000, async () => {
+      const services = (await consulJson(project, composeFile, "/v1/agent/services")) as Record<string, any>;
+      const managed = managedServices(services);
+      const dockerStillPresent = managed.some(
+        (svc: any) => svc.Service === "webdocker" && svc.Meta?.["owner-id"] === "hybrid-docker-owner",
+      );
+      const filePresent = Boolean(services["file-webfile"]);
+      return dockerStillPresent && !filePresent ? true : "file service still present after file deletion";
     });
 
-    compose(project, composeFile, ["pause", "registrator-owner-a"]);
+    compose(project, composeFile, [
+      "exec",
+      "-T",
+      "seed-file-config",
+      "sh",
+      "-ec",
+      "cat > /fixtures/services.d/routes.yml <<'YAML'\nservices:\n  webfile:\n    address: webfile\n    port: 80\n    tags:\n      - traefik.enable=true\n      - traefik.http.routers.webfile.rule=Host(`webfile-recreated.local`)\nYAML",
+    ]);
 
-    await waitUntil("owner-a paused", 30_000, async () => {
-      const ownerA = containerState(project, composeFile, "registrator-owner-a");
-      return ownerA.paused ? true : "owner-a container not paused yet";
-    });
-
-    await waitUntil("owner-a service GC after pause", 90_000, async () => {
-      const owners = await whoamiOwners(project, composeFile);
-      const states = await ownerStates(project, composeFile);
-      const ownerA = containerState(project, composeFile, "registrator-owner-a");
-      const ownerB = containerState(project, composeFile, "registrator-owner-b");
-
-      const cleaned =
-        !owners["owner-a"] &&
-        Boolean(owners["owner-b"]?.length) &&
-        states["owner-b"] === "passing" &&
-        states["owner-a"] !== "passing" &&
-        ownerB.running &&
-        ownerA.paused;
-
-      return cleaned || "owner-a services not cleaned up yet";
+    await waitUntil("file creation propagation", 45_000, async () => {
+      const services = (await consulJson(project, composeFile, "/v1/agent/services")) as Record<string, any>;
+      const fileSvc = services["file-webfile"];
+      if (!fileSvc) return "file service not re-created";
+      const tags = new Set(fileSvc.Tags ?? []);
+      const recreated = tags.has("traefik.http.routers.webfile.rule=Host(`webfile-recreated.local`)");
+      return recreated || "re-created file service does not have expected rule";
     });
   });
 
   registerScenario("recover-owned-stale-services", async (project, composeFile) => {
-    const staleIDs = new Set(["stale-whoami-a", "stale-whoami-b"]);
+    const staleIDs = new Set(["stale-whoami-a", "stale-whoami-b", "stale-catalog-live-owner"]);
+    const foreignIDs = new Set(["stale-foreign-owner", "stale-catalog-foreign-owner"]);
 
     await waitUntil("stale service recovery", 90_000, async () => {
       const services = (await consulJson(project, composeFile, "/v1/agent/services")) as Record<string, any>;
       const instances = (await consulJson(project, composeFile, "/v1/catalog/service/whoami")) as any[];
-      const states = await ownerStates(project, composeFile);
 
       const serviceIDs = new Set(Object.keys(services));
       if ([...staleIDs].some((id) => serviceIDs.has(id))) {
@@ -206,6 +195,10 @@ describe("compose examples", () => {
       const instanceIDs = new Set(instances.map((item) => String(item.ServiceID ?? "")));
       if ([...staleIDs].some((id) => instanceIDs.has(id))) {
         return "stale ids still present in /v1/catalog/service/whoami";
+      }
+
+      if ([...foreignIDs].some((id) => !serviceIDs.has(id) && !instanceIDs.has(id))) {
+        return "foreign owner stale services were removed unexpectedly";
       }
 
       const liveIDs = Object.entries(services)
@@ -220,8 +213,8 @@ describe("compose examples", () => {
         })
         .map(([serviceID]) => serviceID);
 
-      const ok = liveIDs.length > 0 && states["live-owner"] === "passing";
-      return ok || "no live owner-managed docker-* service or heartbeat not passing";
+      const ok = liveIDs.length > 0;
+      return ok || "no live owner-managed docker-* service";
     });
   });
 

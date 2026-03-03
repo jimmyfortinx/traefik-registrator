@@ -26,11 +26,7 @@ services:
         condition: service_healthy
     environment:
       CONSUL_HTTP_ADDR: http://consul:8500
-      POLL_INTERVAL: 2s
-      GC_INTERVAL: 2s
       OWNER_ID: example-filter
-      ORPHAN_GRACE_PERIOD: 20s
-      OWNER_DOWN_GRACE_PERIOD: 20s
       SERVICE_ID_PREFIX: docker-
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

@@ -10,13 +10,11 @@ In `file` mode, it reads service definitions from a file or directory and keeps 
 - Supports two discovery modes:
   - `SOURCE_MODE=docker` (default): discover services from running containers.
   - `SOURCE_MODE=file`: discover services from YAML/YML file(s).
-- Runs a periodic full resync as a safety fallback in both modes.
-- Registers a heartbeat service per registrator owner (`traefik-registrator-owner`).
-- Periodically sweeps stale registrations cluster-wide:
-  - removes services with missing `owner-id` after `ORPHAN_GRACE_PERIOD`
-  - removes services whose owner heartbeat is not passing on that Consul node after `OWNER_DOWN_GRACE_PERIOD`
+- On startup, removes existing Consul services and catalog instances that were created by this project with the same `owner-id`.
+- Never removes or mutates registrations owned by a different `owner-id`.
 - In `docker` mode:
-  - Polls running containers and reconciles registrations on each sync interval.
+  - Builds the full desired service set from currently running containers at startup.
+  - Listens to Docker container events and reconciles on `start`/`stop`/`die`/`destroy`/`kill`/`pause`/`unpause`.
   - By default, only containers with `traefik.enable=true` are registered.
 - Service ID in `docker` mode: `<SERVICE_ID_PREFIX><container-id-12chars>`.
 - Service ID in `file` mode: explicit `id` from file or generated deterministic ID with `SERVICE_ID_PREFIX`.
@@ -40,6 +38,7 @@ In `file` mode, it reads service definitions from a file or directory and keeps 
   - Watches source path changes via filesystem events and triggers sync automatically.
   - Reads services from a YAML/YML file or all `.yaml`/`.yml` files in a directory.
   - If source files are temporarily unavailable or invalid, sync fails and current Consul registrations are preserved.
+- There is no polling loop.
 - Deregisters services only when a sync successfully computes the desired state without those services.
 
 ## Environment
@@ -49,14 +48,8 @@ In `file` mode, it reads service definitions from a file or directory and keeps 
 - `SOURCE_MODE` (default: `docker`, values: `docker`, `file`)
 - `DOCKER_SOCKET` (default: `/var/run/docker.sock`, docker mode only)
 - `FILE_SOURCE_PATH` (default: `/etc/traefik-registrator/services.d`, file mode only)
-- `POLL_INTERVAL` (default: `5m`, periodic full-resync interval)
 - `REQUIRE_TRAEFIK_ENABLE` (default: `true`, docker mode only)
 - `OWNER_ID` (optional, recommended: stable per-server ID; fallback: hostname)
-- `OWNER_HEARTBEAT_TTL` (default: `30s`)
-- `OWNER_HEARTBEAT_PASS_INTERVAL` (default: `10s`, must be lower than TTL)
-- `GC_INTERVAL` (default: `1m`)
-- `ORPHAN_GRACE_PERIOD` (default: `10m`)
-- `OWNER_DOWN_GRACE_PERIOD` (default: `10m`)
 - `SERVICE_ID_PREFIX` (default: `docker-`)
 - `SERVICE_NAME_LABEL` (default: `com.docker.compose.service`)
 - `SERVICE_PORT_LABEL` (default: `consul.port`)
@@ -123,8 +116,6 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e CONSUL_HTTP_ADDR=http://consul.service.consul:8500 \
   -e OWNER_ID=server-a \
-  -e ORPHAN_GRACE_PERIOD=10m \
-  -e OWNER_DOWN_GRACE_PERIOD=10m \
   -e SERVICE_ID_PREFIX=docker- \
   --restart unless-stopped \
   traefik-registrator:local
@@ -188,10 +179,6 @@ services:
     environment:
       CONSUL_HTTP_ADDR: http://tasks.consul-server:8500
       OWNER_ID: '{{.Node.Hostname}}'
-      POLL_INTERVAL: 60s
-      GC_INTERVAL: 30s
-      ORPHAN_GRACE_PERIOD: 2m
-      OWNER_DOWN_GRACE_PERIOD: 2m
       SERVICE_ID_PREFIX: docker-
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -299,11 +286,12 @@ docker compose -f tests/docker-compose.test.yml run --rm tests
 
 All scenario files are in `examples/` and intentionally publish no ports, so multiple worktrees can run them concurrently.
 
-- `examples/basic-registration`: registers a Traefik-enabled service, checks tags/meta, checks owner heartbeat service.
+- `examples/basic-registration`: registers a Traefik-enabled service and verifies docker event updates (`stop` and `start`).
 - `examples/https-only-file`: registers a file-mode service that only exposes HTTPS (`scheme=https`, `port=443`).
 - `examples/traefik-enable-filter`: verifies `REQUIRE_TRAEFIK_ENABLE=true` filtering.
 - `examples/custom-label-overrides`: verifies `SERVICE_*_LABEL` overrides and `REQUIRE_TRAEFIK_ENABLE=false`.
-- `examples/gc-stale-services`: seeds stale catalog entries and verifies GC cleanup for orphan and dead-owner services.
+- `examples/hybrid-docker-file`: verifies docker + file mode can run together and file update/delete/create events reconcile services.
+- `examples/recover-owned-stale-services`: verifies startup owner cleanup removes stale services for matching `OWNER_ID` only.
 
 ## GitHub Actions
 
