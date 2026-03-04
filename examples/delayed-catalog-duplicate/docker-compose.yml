@@ -1,0 +1,104 @@
+services:
+  consul:
+    image: hashicorp/consul:1.20
+    command: agent -dev -client=0.0.0.0
+    healthcheck:
+      test: ["CMD", "consul", "info"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  whoami:
+    image: traefik/whoami:v1.11
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.whoami.loadbalancer.server.port: "80"
+
+  seed-late-duplicate:
+    image: python:3.13-alpine
+    depends_on:
+      consul:
+        condition: service_healthy
+      registrator:
+        condition: service_started
+    command:
+      - python
+      - -c
+      - |
+        import json
+        import time
+        import urllib.request
+
+        consul = "http://consul:8500"
+        owner_id = "example-late-reconcile"
+
+        def get_json(path):
+            with urllib.request.urlopen(consul + path, timeout=5) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        def put(path, payload):
+            req = urllib.request.Request(
+                consul + path,
+                data=json.dumps(payload).encode("utf-8"),
+                method="PUT",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"unexpected status {resp.status}")
+
+        deadline = time.time() + 60
+        service_id = ""
+        while time.time() < deadline:
+            try:
+                services = get_json("/v1/agent/services")
+                for sid, svc in services.items():
+                    meta = svc.get("Meta") or {}
+                    if svc.get("Service") == "whoami" and meta.get("managed-by") == "traefik-registrator" and meta.get("owner-id") == owner_id:
+                        service_id = sid
+                        break
+                if service_id:
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+
+        if not service_id:
+            raise SystemExit("whoami registration not detected in time")
+
+        time.sleep(8)
+        put(
+            "/v1/catalog/register",
+            {
+                "Node": "seed-node-late",
+                "Address": "10.220.0.20",
+                "Service": {
+                    "ID": service_id,
+                    "Service": "whoami",
+                    "Address": "10.220.1.20",
+                    "Port": 80,
+                    "Meta": {
+                        "managed-by": "traefik-registrator",
+                        "owner-id": owner_id,
+                    },
+                },
+            },
+        )
+
+        print(f"seeded delayed duplicate for {service_id}")
+        while True:
+            time.sleep(60)
+
+  registrator:
+    image: traefik-registrator:test
+    build:
+      context: ../..
+    depends_on:
+      consul:
+        condition: service_healthy
+    environment:
+      CONSUL_HTTP_ADDR: http://consul:8500
+      OWNER_ID: example-late-reconcile
+      SERVICE_ID_PREFIX: docker-
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

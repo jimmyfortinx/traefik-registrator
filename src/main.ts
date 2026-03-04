@@ -1,6 +1,7 @@
 import { watch } from "node:fs";
 import { promises as fs } from "node:fs";
 import http from "node:http";
+import { isIP } from "node:net";
 import path from "node:path";
 import process from "node:process";
 import { parse as parseYaml } from "yaml";
@@ -55,6 +56,10 @@ type CatalogInstance = {
   Address?: string;
   ServiceID?: string;
   ServiceMeta?: Record<string, string>;
+};
+type ConsulAgentSelfResponse = {
+  Config?: { NodeName?: string };
+  Member?: { Addr?: string };
 };
 
 type FileServiceDefinition = {
@@ -334,6 +339,21 @@ async function consulRequestAt(
   return response;
 }
 
+function trimTrailingSlash(raw: string): string {
+  return raw.replace(/\/$/, "");
+}
+
+function defaultPortForProtocol(protocol: string): string {
+  return protocol === "https:" ? "443" : "80";
+}
+
+function isDirectConsulHost(rawHost: string): boolean {
+  const host = rawHost.trim().toLowerCase();
+  if (!host) return false;
+  if (host === "localhost" || host === "127.0.0.1" || host === "::1") return true;
+  return isIP(host) !== 0;
+}
+
 function formatHostForURL(raw: string): string {
   if (raw.includes(":") && !raw.startsWith("[") && !raw.endsWith("]")) {
     return `[${raw}]`;
@@ -347,6 +367,44 @@ function nodeAgentBaseAddrFromConfig(cfg: Config, nodeAddress: string): string {
   return `${parsed.protocol}//${formatHostForURL(nodeAddress)}:${port}`;
 }
 
+async function consulAgentSelf(cfg: Config): Promise<ConsulAgentSelfResponse> {
+  const response = await consulRequest(cfg, "GET", "/v1/agent/self");
+  return (await response.json()) as ConsulAgentSelfResponse;
+}
+
+async function pinConsulAddrToSingleAgent(cfg: Config): Promise<void> {
+  let parsed: URL;
+  try {
+    parsed = new URL(cfg.consulHTTPAddr);
+  } catch {
+    return;
+  }
+
+  if (parsed.protocol !== "http:") return;
+  if (isDirectConsulHost(parsed.hostname)) return;
+  if (parsed.pathname !== "" && parsed.pathname !== "/") return;
+
+  const self = await consulAgentSelf(cfg);
+  const memberAddr = (self.Member?.Addr ?? "").trim();
+  if (!memberAddr) return;
+
+  const port = parsed.port || defaultPortForProtocol(parsed.protocol);
+  const candidate = `${parsed.protocol}//${formatHostForURL(memberAddr)}:${port}`;
+  const current = trimTrailingSlash(cfg.consulHTTPAddr);
+
+  if (candidate === current) return;
+
+  try {
+    await consulRequestAt(candidate, cfg.consulToken, "GET", "/v1/status/leader", undefined, 2500);
+  } catch (error) {
+    console.log(`consul endpoint pin skipped for ${candidate}: ${(error as Error).message}`);
+    return;
+  }
+
+  cfg.consulHTTPAddr = candidate;
+  console.log(`consul endpoint pinned: ${cfg.consulHTTPAddr}`);
+}
+
 async function consulLeader(cfg: Config): Promise<string> {
   const response = await consulRequest(cfg, "GET", "/v1/status/leader");
   const raw = (await response.text()).trim();
@@ -354,8 +412,7 @@ async function consulLeader(cfg: Config): Promise<string> {
 }
 
 async function consulLocalNodeName(cfg: Config): Promise<string> {
-  const response = await consulRequest(cfg, "GET", "/v1/agent/self");
-  const parsed = (await response.json()) as { Config?: { NodeName?: string } };
+  const parsed = await consulAgentSelf(cfg);
   return (parsed.Config?.NodeName ?? "").trim();
 }
 
@@ -1034,6 +1091,12 @@ async function run(): Promise<void> {
   console.log("consul is ready");
 
   try {
+    await pinConsulAddrToSingleAgent(cfg);
+  } catch (error) {
+    console.log(`consul endpoint pin skipped: ${(error as Error).message}`);
+  }
+
+  try {
     const detectedNodeName = await consulLocalNodeName(cfg);
     if (detectedNodeName) {
       cfg.localNodeName = detectedNodeName;
@@ -1060,9 +1123,7 @@ async function run(): Promise<void> {
   const controller = new AbortController();
   installSignalHandler(controller);
 
-  if (cfg.sourceMode === sourceModeFile) {
-    scheduleStartupReconciliations(controller.signal, syncRunner.trigger, [3000, 10000, 30000]);
-  }
+  scheduleStartupReconciliations(controller.signal, syncRunner.trigger, [3000, 10000, 30000]);
 
   if (cfg.sourceMode === sourceModeDocker) {
     await watchDockerEvents(

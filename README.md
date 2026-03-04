@@ -15,6 +15,8 @@ In `file` mode, it reads service definitions from a file or directory and keeps 
 - On each reconciliation pass, performs owner-scoped catalog cleanup across all Consul nodes:
   - removes stale instances for the same `owner-id` that are no longer desired;
   - removes duplicate instances that share the same `ServiceID`.
+- Runs delayed startup reconciliations at 3s, 10s, and 30s to catch eventual-consistency drift that appears after initial startup.
+- In `http` mode, if `CONSUL_HTTP_ADDR` points to a DNS host (not a direct IP/localhost), startup pins that address to one concrete Consul agent address from `/v1/agent/self` so agent writes stay sticky.
 - In `docker` mode:
   - Builds the full desired service set from currently running containers at startup.
   - Listens to Docker container events and reconciles on `start`/`stop`/`die`/`destroy`/`kill`/`pause`/`unpause`.
@@ -153,6 +155,7 @@ Recommended:
 
 - For `deploy.mode: global` registrator, set a stable per-node `OWNER_ID` with a Swarm template.
 - Prefer `tasks.consul-server:8500` over `consul-server:8500` to avoid service VIP load-balancing surprises.
+- Keep `CONSUL_HTTP_ADDR` on plain HTTP when possible; startup auto-pinning only applies to `http://` endpoints.
 - Do not share the same `OWNER_ID` across multiple running registrator instances.
 - For a singleton file-mode registrator, set a fixed explicit `OWNER_ID` (for example `file-dokploy`).
 
@@ -296,6 +299,8 @@ All scenario files are in `examples/` and intentionally publish no ports, so mul
 - `examples/custom-label-overrides`: verifies `SERVICE_*_LABEL` overrides and `REQUIRE_TRAEFIK_ENABLE=false`.
 - `examples/hybrid-docker-file`: verifies docker + file mode can run together and file update/delete/create events reconcile services.
 - `examples/recover-owned-stale-services`: verifies startup owner cleanup removes stale services for matching `OWNER_ID` only.
+- `examples/delayed-catalog-duplicate`: injects a duplicate catalog instance after startup and verifies delayed startup reconciliation prunes it.
+- `examples/consul-lb-flap`: verifies startup pinning keeps agent registrations on a single Consul backend when `CONSUL_HTTP_ADDR` is load-balanced.
 
 ## GitHub Actions
 

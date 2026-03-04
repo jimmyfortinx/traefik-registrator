@@ -1,0 +1,58 @@
+services:
+  consul-a:
+    image: hashicorp/consul:1.20
+    command:
+      - /bin/sh
+      - -ec
+      - consul agent -dev -client=0.0.0.0 -node=consul-a -bind="$(hostname -i)"
+    healthcheck:
+      test: ["CMD", "consul", "info"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  consul-b:
+    image: hashicorp/consul:1.20
+    command:
+      - /bin/sh
+      - -ec
+      - consul agent -dev -client=0.0.0.0 -node=consul-b -bind="$(hostname -i)"
+    healthcheck:
+      test: ["CMD", "consul", "info"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  consul-lb:
+    image: haproxy:3.0-alpine
+    depends_on:
+      consul-a:
+        condition: service_healthy
+      consul-b:
+        condition: service_healthy
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+
+  whoami:
+    image: traefik/whoami:v1.11
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.whoami.loadbalancer.server.port: "80"
+
+  registrator:
+    image: traefik-registrator:test
+    build:
+      context: ../..
+    depends_on:
+      consul-a:
+        condition: service_healthy
+      consul-b:
+        condition: service_healthy
+      consul-lb:
+        condition: service_started
+    environment:
+      CONSUL_HTTP_ADDR: http://consul-lb:8500
+      OWNER_ID: example-consul-lb
+      SERVICE_ID_PREFIX: docker-
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
