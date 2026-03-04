@@ -12,6 +12,9 @@ In `file` mode, it reads service definitions from a file or directory and keeps 
   - `SOURCE_MODE=file`: discover services from YAML/YML file(s).
 - On startup, removes existing Consul services and catalog instances that were created by this project with the same `owner-id`.
 - Never removes or mutates registrations owned by a different `owner-id`.
+- On each reconciliation pass, performs owner-scoped catalog cleanup across all Consul nodes:
+  - removes stale instances for the same `owner-id` that are no longer desired;
+  - removes duplicate instances that share the same `ServiceID`.
 - In `docker` mode:
   - Builds the full desired service set from currently running containers at startup.
   - Listens to Docker container events and reconciles on `start`/`stop`/`die`/`destroy`/`kill`/`pause`/`unpause`.
@@ -38,7 +41,7 @@ In `file` mode, it reads service definitions from a file or directory and keeps 
   - Watches source path changes via filesystem events and triggers sync automatically.
   - Reads services from a YAML/YML file or all `.yaml`/`.yml` files in a directory.
   - If source files are temporarily unavailable or invalid, sync fails and current Consul registrations are preserved.
-- There is no polling loop.
+- There is no container/file discovery polling loop; updates are event-driven.
 - Deregisters services only when a sync successfully computes the desired state without those services.
 
 ## Environment
@@ -287,6 +290,7 @@ docker compose -f tests/docker-compose.test.yml run --rm tests
 All scenario files are in `examples/` and intentionally publish no ports, so multiple worktrees can run them concurrently.
 
 - `examples/basic-registration`: registers a Traefik-enabled service and verifies docker event updates (`stop` and `start`).
+- `examples/gc-stale-services`: verifies owner-scoped catalog cleanup removes stale services for the current `OWNER_ID` across nodes while leaving other owners untouched.
 - `examples/https-only-file`: registers a file-mode service that only exposes HTTPS (`scheme=https`, `port=443`).
 - `examples/traefik-enable-filter`: verifies `REQUIRE_TRAEFIK_ENABLE=true` filtering.
 - `examples/custom-label-overrides`: verifies `SERVICE_*_LABEL` overrides and `REQUIRE_TRAEFIK_ENABLE=false`.
@@ -299,6 +303,7 @@ Workflow file: `.github/workflows/docker.yml`
 
 - Runs on pull requests (build only).
 - Runs on pushes to `main` and tags matching `v*`.
+- Always runs both compose e2e and swarm e2e test jobs before image build.
 - Pushes multi-arch images (`linux/amd64`, `linux/arm64`) to:
   - `ghcr.io/<owner>/<repo>`
 - Generates tags from branch, tag, commit SHA, and `latest` on the default branch.

@@ -15,6 +15,7 @@ type Config = {
   fileSourcePath: string;
   requireTraefikEnable: boolean;
   ownerID: string;
+  localNodeName: string;
   serviceIDPrefix: string;
   serviceNameLabel: string;
   servicePortLabel: string;
@@ -93,6 +94,7 @@ function loadConfig(): Config {
     fileSourcePath: env("FILE_SOURCE_PATH", "/etc/traefik-registrator/services.d"),
     requireTraefikEnable: parseBool(env("REQUIRE_TRAEFIK_ENABLE", "true")),
     ownerID: env("OWNER_ID", ownerFromHost),
+    localNodeName: ownerFromHost,
     serviceIDPrefix: env("SERVICE_ID_PREFIX", "docker-"),
     serviceNameLabel: env("SERVICE_NAME_LABEL", "com.docker.compose.service"),
     servicePortLabel: env("SERVICE_PORT_LABEL", "consul.port"),
@@ -599,6 +601,74 @@ function isOwnedManagedService(meta: Record<string, string> | undefined, ownerID
   return (meta[ownerIDMetaKey] ?? "").trim() === ownerID;
 }
 
+type OwnedCatalogCleanupResult = {
+  removedTotal: number;
+  removedNotDesired: number;
+  removedDuplicates: number;
+};
+
+function prioritizeLocalNode(
+  instances: CatalogInstance[],
+  localNodeName: string,
+): CatalogInstance[] {
+  if (!localNodeName) return instances;
+  return [...instances].sort((left, right) => {
+    const leftLocal = (left.Node ?? "").trim() === localNodeName;
+    const rightLocal = (right.Node ?? "").trim() === localNodeName;
+    if (leftLocal === rightLocal) return 0;
+    return leftLocal ? -1 : 1;
+  });
+}
+
+async function cleanupOwnedCatalogServices(
+  cfg: Config,
+  desiredIDs?: Set<string>,
+): Promise<OwnedCatalogCleanupResult> {
+  let removedTotal = 0;
+  let removedNotDesired = 0;
+  let removedDuplicates = 0;
+  const keptDesired = new Set<string>();
+  const catalogServices = await listCatalogServices(cfg);
+
+  for (const serviceName of Object.keys(catalogServices).sort()) {
+    const rawInstances = await listCatalogServiceInstances(cfg, serviceName);
+    const instances = prioritizeLocalNode(rawInstances, cfg.localNodeName);
+
+    for (const instance of instances) {
+      if (!isOwnedManagedService(instance.ServiceMeta, cfg.ownerID)) continue;
+
+      const node = (instance.Node ?? "").trim();
+      const serviceID = (instance.ServiceID ?? "").trim();
+      if (!node || !serviceID) continue;
+
+      let reason: "not-desired" | "duplicate" | null = null;
+      if (desiredIDs) {
+        if (!desiredIDs.has(serviceID)) {
+          reason = "not-desired";
+        } else if (keptDesired.has(serviceID)) {
+          reason = "duplicate";
+        } else {
+          keptDesired.add(serviceID);
+        }
+      } else {
+        reason = "not-desired";
+      }
+      if (!reason) continue;
+
+      try {
+        await deregisterCatalogService(cfg, node, serviceID);
+        removedTotal += 1;
+        if (reason === "not-desired") removedNotDesired += 1;
+        else removedDuplicates += 1;
+      } catch (error) {
+        console.log(`catalog cleanup deregister failed for ${node}/${serviceID}: ${(error as Error).message}`);
+      }
+    }
+  }
+
+  return { removedTotal, removedNotDesired, removedDuplicates };
+}
+
 async function cleanupOwnedServicesOnStartup(cfg: Config): Promise<void> {
   let removedAgent = 0;
   let removedCatalog = 0;
@@ -619,30 +689,8 @@ async function cleanupOwnedServicesOnStartup(cfg: Config): Promise<void> {
   }
 
   try {
-    const byService = await listCatalogServices(cfg);
-    const seen = new Set<string>();
-
-    for (const serviceName of Object.keys(byService).sort()) {
-      const instances = await listCatalogServiceInstances(cfg, serviceName);
-      for (const instance of instances) {
-        if (!isOwnedManagedService(instance.ServiceMeta, cfg.ownerID)) continue;
-
-        const node = (instance.Node ?? "").trim();
-        const serviceID = (instance.ServiceID ?? "").trim();
-        if (!node || !serviceID) continue;
-
-        const key = `${node}/${serviceID}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-
-        try {
-          await deregisterCatalogService(cfg, node, serviceID);
-          removedCatalog += 1;
-        } catch (error) {
-          console.log(`startup cleanup catalog deregister failed for ${key}: ${(error as Error).message}`);
-        }
-      }
-    }
+    const result = await cleanupOwnedCatalogServices(cfg);
+    removedCatalog = result.removedTotal;
   } catch (error) {
     console.log(`startup cleanup catalog scan skipped: ${(error as Error).message}`);
   }
@@ -723,8 +771,18 @@ async function applyDesiredState(
     console.log(`owned-service prune skipped: ${(error as Error).message}`);
   }
 
+  let removedCatalogNotDesired = 0;
+  let removedCatalogDuplicates = 0;
+  try {
+    const catalogCleanup = await cleanupOwnedCatalogServices(cfg, new Set(desired.keys()));
+    removedCatalogNotDesired = catalogCleanup.removedNotDesired;
+    removedCatalogDuplicates = catalogCleanup.removedDuplicates;
+  } catch (error) {
+    console.log(`catalog cleanup skipped: ${(error as Error).message}`);
+  }
+
   console.log(
-    `sync complete: ${sourceSummary} desired=${desired.size} upserted=${upserted} removed_not_desired=${removedNoLongerDesired} removed_unexpected_owned=${removedUnexpected}`,
+    `sync complete: ${sourceSummary} desired=${desired.size} upserted=${upserted} removed_not_desired=${removedNoLongerDesired} removed_unexpected_owned=${removedUnexpected} removed_catalog_not_desired=${removedCatalogNotDesired} removed_catalog_duplicates=${removedCatalogDuplicates}`,
   );
 }
 
