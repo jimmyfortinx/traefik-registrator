@@ -52,6 +52,7 @@ type ConsulServiceRegistration = {
 type AgentService = { ID?: string; Meta?: Record<string, string> };
 type CatalogInstance = {
   Node?: string;
+  Address?: string;
   ServiceID?: string;
   ServiceMeta?: Record<string, string>;
 };
@@ -284,15 +285,45 @@ function streamDockerEventsOnce(
 }
 
 async function consulRequest(cfg: Config, method: string, requestPath: string, body?: unknown): Promise<Response> {
-  const url = `${cfg.consulHTTPAddr.replace(/\/$/, "")}${requestPath}`;
-  const headers: Record<string, string> = body === undefined ? {} : { "Content-Type": "application/json" };
-  if (cfg.consulToken) headers["X-Consul-Token"] = cfg.consulToken;
+  return consulRequestAt(cfg.consulHTTPAddr, cfg.consulToken, method, requestPath, body);
+}
 
-  const response = await fetch(url, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+async function consulRequestAt(
+  baseAddr: string,
+  consulToken: string,
+  method: string,
+  requestPath: string,
+  body?: unknown,
+  timeoutMs = 0,
+): Promise<Response> {
+  const url = `${baseAddr.replace(/\/$/, "")}${requestPath}`;
+  const headers: Record<string, string> = body === undefined ? {} : { "Content-Type": "application/json" };
+  if (consulToken) headers["X-Consul-Token"] = consulToken;
+
+  const controller = timeoutMs > 0 ? new AbortController() : undefined;
+  const timeoutHandle =
+    timeoutMs > 0
+      ? setTimeout(() => {
+          controller?.abort();
+        }, timeoutMs)
+      : undefined;
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: controller?.signal,
+    });
+  } catch (error) {
+    if (controller?.signal.aborted) {
+      throw new Error(`consul API ${method} ${requestPath} timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
 
   if (!response.ok) {
     const text = await response.text();
@@ -303,10 +334,29 @@ async function consulRequest(cfg: Config, method: string, requestPath: string, b
   return response;
 }
 
+function formatHostForURL(raw: string): string {
+  if (raw.includes(":") && !raw.startsWith("[") && !raw.endsWith("]")) {
+    return `[${raw}]`;
+  }
+  return raw;
+}
+
+function nodeAgentBaseAddrFromConfig(cfg: Config, nodeAddress: string): string {
+  const parsed = new URL(cfg.consulHTTPAddr);
+  const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+  return `${parsed.protocol}//${formatHostForURL(nodeAddress)}:${port}`;
+}
+
 async function consulLeader(cfg: Config): Promise<string> {
   const response = await consulRequest(cfg, "GET", "/v1/status/leader");
   const raw = (await response.text()).trim();
   return raw.replace(/^"/, "").replace(/"$/, "").trim();
+}
+
+async function consulLocalNodeName(cfg: Config): Promise<string> {
+  const response = await consulRequest(cfg, "GET", "/v1/agent/self");
+  const parsed = (await response.json()) as { Config?: { NodeName?: string } };
+  return (parsed.Config?.NodeName ?? "").trim();
 }
 
 async function waitForConsulReady(cfg: Config, timeoutMs: number): Promise<void> {
@@ -357,6 +407,27 @@ async function deregisterCatalogService(cfg: Config, node: string, serviceID: st
     Node: node,
     ServiceID: serviceID,
   });
+}
+
+async function deregisterNodeAgentService(cfg: Config, nodeAddress: string, serviceID: string): Promise<boolean> {
+  const address = nodeAddress.trim();
+  if (!address) return false;
+
+  const baseAddr = nodeAgentBaseAddrFromConfig(cfg, address);
+  try {
+    await consulRequestAt(
+      baseAddr,
+      cfg.consulToken,
+      "PUT",
+      `/v1/agent/service/deregister/${encodeURIComponent(serviceID)}`,
+      undefined,
+      2500,
+    );
+    return true;
+  } catch (error) {
+    console.log(`node-agent cleanup skipped for ${address}/${serviceID}: ${(error as Error).message}`);
+    return false;
+  }
 }
 
 function shortID(raw: string): string {
@@ -605,6 +676,7 @@ type OwnedCatalogCleanupResult = {
   removedTotal: number;
   removedNotDesired: number;
   removedDuplicates: number;
+  removedNodeAgentServices: number;
 };
 
 function prioritizeLocalNode(
@@ -627,6 +699,7 @@ async function cleanupOwnedCatalogServices(
   let removedTotal = 0;
   let removedNotDesired = 0;
   let removedDuplicates = 0;
+  let removedNodeAgentServices = 0;
   const keptDesired = new Set<string>();
   const catalogServices = await listCatalogServices(cfg);
 
@@ -660,18 +733,22 @@ async function cleanupOwnedCatalogServices(
         removedTotal += 1;
         if (reason === "not-desired") removedNotDesired += 1;
         else removedDuplicates += 1;
+        if (await deregisterNodeAgentService(cfg, instance.Address ?? "", serviceID)) {
+          removedNodeAgentServices += 1;
+        }
       } catch (error) {
         console.log(`catalog cleanup deregister failed for ${node}/${serviceID}: ${(error as Error).message}`);
       }
     }
   }
 
-  return { removedTotal, removedNotDesired, removedDuplicates };
+  return { removedTotal, removedNotDesired, removedDuplicates, removedNodeAgentServices };
 }
 
 async function cleanupOwnedServicesOnStartup(cfg: Config): Promise<void> {
   let removedAgent = 0;
   let removedCatalog = 0;
+  let removedNodeAgentServices = 0;
 
   try {
     const services = await listAgentServices(cfg);
@@ -691,11 +768,14 @@ async function cleanupOwnedServicesOnStartup(cfg: Config): Promise<void> {
   try {
     const result = await cleanupOwnedCatalogServices(cfg);
     removedCatalog = result.removedTotal;
+    removedNodeAgentServices = result.removedNodeAgentServices;
   } catch (error) {
     console.log(`startup cleanup catalog scan skipped: ${(error as Error).message}`);
   }
 
-  console.log(`startup cleanup complete: owner_id=${cfg.ownerID} removed_agent=${removedAgent} removed_catalog=${removedCatalog}`);
+  console.log(
+    `startup cleanup complete: owner_id=${cfg.ownerID} removed_agent=${removedAgent} removed_catalog=${removedCatalog} removed_node_agent=${removedNodeAgentServices}`,
+  );
 }
 
 async function pruneUnexpectedOwnedAgentServices(
@@ -773,16 +853,18 @@ async function applyDesiredState(
 
   let removedCatalogNotDesired = 0;
   let removedCatalogDuplicates = 0;
+  let removedCatalogNodeAgentServices = 0;
   try {
     const catalogCleanup = await cleanupOwnedCatalogServices(cfg, new Set(desired.keys()));
     removedCatalogNotDesired = catalogCleanup.removedNotDesired;
     removedCatalogDuplicates = catalogCleanup.removedDuplicates;
+    removedCatalogNodeAgentServices = catalogCleanup.removedNodeAgentServices;
   } catch (error) {
     console.log(`catalog cleanup skipped: ${(error as Error).message}`);
   }
 
   console.log(
-    `sync complete: ${sourceSummary} desired=${desired.size} upserted=${upserted} removed_not_desired=${removedNoLongerDesired} removed_unexpected_owned=${removedUnexpected} removed_catalog_not_desired=${removedCatalogNotDesired} removed_catalog_duplicates=${removedCatalogDuplicates}`,
+    `sync complete: ${sourceSummary} desired=${desired.size} upserted=${upserted} removed_not_desired=${removedNoLongerDesired} removed_unexpected_owned=${removedUnexpected} removed_catalog_not_desired=${removedCatalogNotDesired} removed_catalog_duplicates=${removedCatalogDuplicates} removed_node_agent=${removedCatalogNodeAgentServices}`,
   );
 }
 
@@ -909,6 +991,30 @@ async function waitForAbort(signal: AbortSignal): Promise<void> {
   });
 }
 
+function scheduleStartupReconciliations(
+  signal: AbortSignal,
+  trigger: (reason: string) => void,
+  delaysMs: number[],
+): void {
+  const timers: ReturnType<typeof setTimeout>[] = [];
+
+  for (const delay of delaysMs) {
+    timers.push(
+      setTimeout(() => {
+        if (!signal.aborted) trigger(`startup-reconcile:${delay}ms`);
+      }, delay),
+    );
+  }
+
+  signal.addEventListener(
+    "abort",
+    () => {
+      for (const timer of timers) clearTimeout(timer);
+    },
+    { once: true },
+  );
+}
+
 async function run(): Promise<void> {
   const cfg = loadConfig();
   await validateConfig(cfg);
@@ -927,6 +1033,16 @@ async function run(): Promise<void> {
   await waitForConsulReady(cfg, 90_000);
   console.log("consul is ready");
 
+  try {
+    const detectedNodeName = await consulLocalNodeName(cfg);
+    if (detectedNodeName) {
+      cfg.localNodeName = detectedNodeName;
+      console.log(`local consul node detected: ${cfg.localNodeName}`);
+    }
+  } catch (error) {
+    console.log(`local consul node detection skipped: ${(error as Error).message}`);
+  }
+
   const managed = new Set<string>();
   await cleanupOwnedServicesOnStartup(cfg);
 
@@ -943,6 +1059,10 @@ async function run(): Promise<void> {
 
   const controller = new AbortController();
   installSignalHandler(controller);
+
+  if (cfg.sourceMode === sourceModeFile) {
+    scheduleStartupReconciliations(controller.signal, syncRunner.trigger, [3000, 10000, 30000]);
+  }
 
   if (cfg.sourceMode === sourceModeDocker) {
     await watchDockerEvents(
