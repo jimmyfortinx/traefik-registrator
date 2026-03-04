@@ -48,43 +48,77 @@ services:
                     raise RuntimeError(f"unexpected status {resp.status}")
 
         put(
-            "/v1/catalog/register",
-            {
-                "Node": "seed-node-a",
-                "Address": "10.200.0.1",
-                "Service": {
-                    "ID": "seed-orphan",
-                    "Service": "orphan-app",
-                    "Address": "10.200.1.10",
-                    "Port": 8080,
-                    "Meta": {
-                        "managed-by": "traefik-registrator",
-                    },
-                },
+          "/v1/catalog/register",
+          {
+            "Node": "seed-node-a",
+            "Address": "10.200.0.1",
+            "Service": {
+              "ID": "seed-live-owner-a",
+              "Service": "stale-live-owner-app",
+              "Address": "10.200.1.10",
+              "Port": 8080,
+              "Meta": {
+                "managed-by": "traefik-registrator",
+                "owner-id": "live-owner",
+              },
             },
+          },
         )
 
         put(
             "/v1/catalog/register",
-            {
-                "Node": "seed-node-b",
-                "Address": "10.200.0.2",
-                "Service": {
-                    "ID": "seed-dead-owner",
-                    "Service": "dead-owner-app",
-                    "Address": "10.200.1.11",
-                    "Port": 8081,
-                    "Meta": {
-                        "managed-by": "traefik-registrator",
-                        "owner-id": "dead-owner",
-                    },
-                },
+          {
+            "Node": "seed-node-b",
+            "Address": "10.200.0.2",
+            "Service": {
+              "ID": "seed-live-owner-b",
+              "Service": "stale-live-owner-app",
+              "Address": "10.200.1.11",
+              "Port": 8081,
+              "Meta": {
+                "managed-by": "traefik-registrator",
+                "owner-id": "live-owner",
+              },
             },
+          },
+        )
+
+        put(
+          "/v1/catalog/register",
+          {
+            "Node": "seed-node-c",
+            "Address": "10.200.0.3",
+            "Service": {
+              "ID": "seed-foreign-owner",
+              "Service": "foreign-owner-app",
+              "Address": "10.200.1.12",
+              "Port": 8082,
+              "Meta": {
+                "managed-by": "traefik-registrator",
+                "owner-id": "foreign-owner",
+              },
+            },
+          },
         )
 
         print("seeded stale services")
         while True:
             time.sleep(60)
+
+  startup-gate:
+    image: alpine:3.21
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        sleep 8
+        touch /tmp/ready
+        tail -f /dev/null
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/ready"]
+      interval: 1s
+      timeout: 1s
+      retries: 20
 
   registrator:
     image: traefik-registrator:test
@@ -93,10 +127,13 @@ services:
     depends_on:
       consul:
         condition: service_healthy
+      seed:
+        condition: service_started
+      startup-gate:
+        condition: service_healthy
     environment:
       CONSUL_HTTP_ADDR: http://consul:8500
       OWNER_ID: live-owner
       SERVICE_ID_PREFIX: docker-
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-

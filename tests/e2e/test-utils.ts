@@ -88,22 +88,8 @@ export async function consulJson(project: string, composeFile: string, pathAndQu
 export function managedServices(agentServices: Record<string, any>): any[] {
   return Object.values(agentServices).filter((svc: any) => {
     const meta = svc.Meta ?? {};
-    return meta["managed-by"] === "traefik-registrator" && meta.kind !== "owner-heartbeat";
+    return meta["managed-by"] === "traefik-registrator";
   });
-}
-
-export async function ownerStates(project: string, composeFile: string): Promise<Record<string, string>> {
-  const checks = (await consulJson(project, composeFile, "/v1/health/checks/traefik-registrator-owner")) as any[];
-  const states: Record<string, string> = {};
-
-  for (const check of checks) {
-    const serviceID = String(check.ServiceID ?? "");
-    if (!serviceID.startsWith("traefik-registrator-owner-")) continue;
-    const owner = serviceID.slice("traefik-registrator-owner-".length);
-    if (owner) states[owner] = String(check.Status ?? "");
-  }
-
-  return states;
 }
 
 export async function whoamiOwners(project: string, composeFile: string): Promise<Record<string, string[]>> {

@@ -65,6 +65,17 @@ describe("compose examples", () => {
     });
   });
 
+  registerScenario("gc-stale-services", async (project, composeFile) => {
+    await waitUntil("owner-scoped catalog cleanup", 90_000, async () => {
+      const owned = (await consulJson(project, composeFile, "/v1/catalog/service/stale-live-owner-app")) as any[];
+      const foreign = (await consulJson(project, composeFile, "/v1/catalog/service/foreign-owner-app")) as any[];
+      const hasOwnedA = owned.some((item) => item.ServiceID === "seed-live-owner-a");
+      const hasOwnedB = owned.some((item) => item.ServiceID === "seed-live-owner-b");
+      const hasForeign = foreign.some((item) => item.ServiceID === "seed-foreign-owner");
+      return !hasOwnedA && !hasOwnedB && hasForeign ? true : "owner-scoped cleanup did not converge";
+    });
+  });
+
   registerScenario("https-only-file", async (project, composeFile) => {
     await waitUntil("https file-mode registration", 90_000, async () => {
       const services = (await consulJson(project, composeFile, "/v1/agent/services")) as Record<string, any>;
@@ -206,7 +217,6 @@ describe("compose examples", () => {
           const meta = svc.Meta ?? {};
           return (
             meta["managed-by"] === "traefik-registrator" &&
-            meta.kind !== "owner-heartbeat" &&
             meta["owner-id"] === "live-owner" &&
             serviceID.startsWith("docker-")
           );
