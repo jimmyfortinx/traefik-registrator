@@ -1,0 +1,86 @@
+services:
+  consul-a:
+    image: hashicorp/consul:1.20
+    command:
+      - /bin/sh
+      - -ec
+      - consul agent -dev -client=0.0.0.0 -node=consul-a -bind="$(hostname -i)"
+    healthcheck:
+      test: ["CMD", "consul", "info"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  consul-b:
+    image: hashicorp/consul:1.20
+    command:
+      - /bin/sh
+      - -ec
+      - consul agent -dev -client=0.0.0.0 -node=consul-b -bind="$(hostname -i)"
+    healthcheck:
+      test: ["CMD", "consul", "info"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  consul-lb:
+    image: haproxy:3.0-alpine
+    depends_on:
+      consul-a:
+        condition: service_healthy
+      consul-b:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        cat > /tmp/haproxy.cfg <<'CFG'
+        global
+          maxconn 256
+
+        defaults
+          mode http
+          option httpclose
+          timeout connect 5s
+          timeout client 30s
+          timeout server 30s
+
+        frontend consul_http
+          bind *:8500
+          default_backend consul_nodes
+
+        backend consul_nodes
+          balance roundrobin
+          server consul_a consul-a:8500 check
+          server consul_b consul-b:8500 check
+        CFG
+        exec haproxy -W -db -f /tmp/haproxy.cfg
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8500/v1/status/leader >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  whoami:
+    image: traefik/whoami:v1.11
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.whoami.loadbalancer.server.port: "80"
+
+  registrator:
+    image: traefik-registrator:test
+    build:
+      context: ../..
+    depends_on:
+      consul-a:
+        condition: service_healthy
+      consul-b:
+        condition: service_healthy
+      consul-lb:
+        condition: service_healthy
+    environment:
+      CONSUL_HTTP_ADDR: http://consul-lb:8500
+      OWNER_ID: example-consul-lb
+      SERVICE_ID_PREFIX: docker-
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
