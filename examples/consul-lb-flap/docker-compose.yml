@@ -32,6 +32,11 @@ services:
         condition: service_healthy
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8500/v1/status/leader >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
 
   whoami:
     image: traefik/whoami:v1.11
@@ -49,7 +54,7 @@ services:
       consul-b:
         condition: service_healthy
       consul-lb:
-        condition: service_started
+        condition: service_healthy
     environment:
       CONSUL_HTTP_ADDR: http://consul-lb:8500
       OWNER_ID: example-consul-lb

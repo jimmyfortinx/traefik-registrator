@@ -307,6 +307,8 @@ describe("compose examples", () => {
       });
     };
 
+    // Trigger a deterministic post-start docker event to avoid startup ordering flakes.
+    compose(project, composeFile, ["restart", "whoami"]);
     await expectSingleBackend("initial registration sticks to one consul backend", 90_000);
 
     for (let cycle = 1; cycle <= 3; cycle += 1) {
