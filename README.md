@@ -17,6 +17,8 @@ In `file` mode, it reads service definitions from a file or directory and keeps 
   - removes duplicate instances that share the same `ServiceID`.
 - Runs delayed startup reconciliations at 3s, 10s, and 30s to catch eventual-consistency drift that appears after initial startup.
 - In `http` mode, if `CONSUL_HTTP_ADDR` points to a DNS host (not a direct IP/localhost), startup pins that address to one concrete Consul agent address from `/v1/agent/self` so agent writes stay sticky.
+- Node-agent cleanup retries deregistration on native Consul agent ports (`8500` for HTTP, `8501` for HTTPS) when `CONSUL_HTTP_ADDR` uses a different port (for example a published host port like `18500`).
+- If catalog cleanup cannot reach the source node agent for a stale instance, logs a warning that the instance may reappear due to Consul anti-entropy.
 - In `docker` mode:
   - Builds the full desired service set from currently running containers at startup.
   - Listens to Docker container events and reconciles on `start`/`stop`/`die`/`destroy`/`kill`/`pause`/`unpause`.
@@ -60,6 +62,7 @@ In `file` mode, it reads service definitions from a file or directory and keeps 
 - `SERVICE_PORT_LABEL` (default: `consul.port`)
 - `SERVICE_ADDRESS_LABEL` (default: `consul.address`)
 - `DEFAULT_SERVICE_NAME` (default: `container`)
+- `LOG_VERBOSE_CATALOG_CLEANUP` (default: `false`, logs per-instance catalog cleanup decisions and actions)
 
 ## File Mode Schema
 
@@ -203,6 +206,33 @@ services:
 
 If you still observe duplicate service registrations on different Consul nodes, point each registrator to a node-local Consul agent (client) instead of a shared/load-balanced endpoint.
 
+## Remote Consul Debug (No Swarm)
+
+Use `examples/remote-consul-debug` to run file-mode registrator from Docker Compose against a remote Consul HTTP endpoint, without joining Docker Swarm.
+
+1. Copy env defaults:
+
+```bash
+cd examples/remote-consul-debug
+cp .env.example .env
+```
+
+2. Adjust `.env` as needed (`CONSUL_HTTP_ADDR`, `OWNER_ID`, local `FILE_SOURCE_PATH_HOST`).
+
+3. Start:
+
+```bash
+docker compose up --build -d
+```
+
+4. Follow logs:
+
+```bash
+docker compose logs -f registrator-file
+```
+
+The compose setup enables `LOG_VERBOSE_CATALOG_CLEANUP=true` by default so you can see which node/service duplicate cleanup targets and when node-agent cleanup is unreachable.
+
 ## Local End-to-End Test
 
 `docker-compose.yml` starts:
@@ -301,6 +331,7 @@ All scenario files are in `examples/` and intentionally publish no ports, so mul
 - `examples/recover-owned-stale-services`: verifies startup owner cleanup removes stale services for matching `OWNER_ID` only.
 - `examples/delayed-catalog-duplicate`: injects a duplicate catalog instance after startup and verifies delayed startup reconciliation prunes it.
 - `examples/consul-lb-flap`: verifies startup pinning keeps agent registrations on a single Consul backend when `CONSUL_HTTP_ADDR` is load-balanced.
+- `examples/remote-consul-debug`: reusable non-swarm compose setup for debugging against external Consul servers with verbose cleanup traces.
 
 ## GitHub Actions
 

@@ -1,0 +1,7 @@
+services:
+  debug-app:
+    address: 10.1.10.10
+    port: 5000
+    tags:
+      - traefik.enable=true
+      - traefik.http.routers.debug-app.rule=Host(`debug.local`)

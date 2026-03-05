@@ -17,6 +17,7 @@ type Config = {
   requireTraefikEnable: boolean;
   ownerID: string;
   localNodeName: string;
+  verboseCatalogCleanup: boolean;
   serviceIDPrefix: string;
   serviceNameLabel: string;
   servicePortLabel: string;
@@ -101,6 +102,7 @@ function loadConfig(): Config {
     requireTraefikEnable: parseBool(env("REQUIRE_TRAEFIK_ENABLE", "true")),
     ownerID: env("OWNER_ID", ownerFromHost),
     localNodeName: ownerFromHost,
+    verboseCatalogCleanup: parseBool(env("LOG_VERBOSE_CATALOG_CLEANUP", "false")),
     serviceIDPrefix: env("SERVICE_ID_PREFIX", "docker-"),
     serviceNameLabel: env("SERVICE_NAME_LABEL", "com.docker.compose.service"),
     servicePortLabel: env("SERVICE_PORT_LABEL", "consul.port"),
@@ -347,6 +349,10 @@ function defaultPortForProtocol(protocol: string): string {
   return protocol === "https:" ? "443" : "80";
 }
 
+function defaultConsulAgentPortForProtocol(protocol: string): string {
+  return protocol === "https:" ? "8501" : "8500";
+}
+
 function isDirectConsulHost(rawHost: string): boolean {
   const host = rawHost.trim().toLowerCase();
   if (!host) return false;
@@ -361,10 +367,16 @@ function formatHostForURL(raw: string): string {
   return raw;
 }
 
-function nodeAgentBaseAddrFromConfig(cfg: Config, nodeAddress: string): string {
+function nodeAgentBaseAddrsFromConfig(cfg: Config, nodeAddress: string): string[] {
   const parsed = new URL(cfg.consulHTTPAddr);
-  const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
-  return `${parsed.protocol}//${formatHostForURL(nodeAddress)}:${port}`;
+  const host = formatHostForURL(nodeAddress);
+  const configuredPort = parsed.port || defaultPortForProtocol(parsed.protocol);
+  const nativeAgentPort = defaultConsulAgentPortForProtocol(parsed.protocol);
+  const out = [`${parsed.protocol}//${host}:${configuredPort}`];
+  if (configuredPort !== nativeAgentPort) {
+    out.push(`${parsed.protocol}//${host}:${nativeAgentPort}`);
+  }
+  return out;
 }
 
 async function consulAgentSelf(cfg: Config): Promise<ConsulAgentSelfResponse> {
@@ -466,25 +478,48 @@ async function deregisterCatalogService(cfg: Config, node: string, serviceID: st
   });
 }
 
-async function deregisterNodeAgentService(cfg: Config, nodeAddress: string, serviceID: string): Promise<boolean> {
+function isRequestTimeoutError(raw: string): boolean {
+  const message = raw.trim().toLowerCase();
+  return message.includes("timed out");
+}
+
+async function deregisterNodeAgentService(
+  cfg: Config,
+  serviceName: string,
+  nodeName: string,
+  nodeAddress: string,
+  serviceID: string,
+): Promise<boolean> {
   const address = nodeAddress.trim();
   if (!address) return false;
 
-  const baseAddr = nodeAgentBaseAddrFromConfig(cfg, address);
-  try {
-    await consulRequestAt(
-      baseAddr,
-      cfg.consulToken,
-      "PUT",
-      `/v1/agent/service/deregister/${encodeURIComponent(serviceID)}`,
-      undefined,
-      2500,
-    );
-    return true;
-  } catch (error) {
-    console.log(`node-agent cleanup skipped for ${address}/${serviceID}: ${(error as Error).message}`);
-    return false;
+  const baseAddrs = nodeAgentBaseAddrsFromConfig(cfg, address);
+  const reqPath = `/v1/agent/service/deregister/${encodeURIComponent(serviceID)}`;
+  let lastError = "";
+
+  for (const [index, baseAddr] of baseAddrs.entries()) {
+    try {
+      await consulRequestAt(baseAddr, cfg.consulToken, "PUT", reqPath, undefined, 2500);
+      if (index > 0) {
+        console.log(
+          `node-agent cleanup fallback succeeded: service=${serviceName} service_id=${serviceID} node=${nodeName || "-"} node_addr=${address} endpoint=${baseAddr}`,
+        );
+      }
+      return true;
+    } catch (error) {
+      lastError = (error as Error).message;
+      if (isRequestTimeoutError(lastError)) {
+        console.log(
+          `node-agent unregister timeout: service=${serviceName} service_id=${serviceID} node=${nodeName || "-"} node_addr=${address} endpoint=${baseAddr} attempt=${index + 1}/${baseAddrs.length} error=${lastError}`,
+        );
+      }
+    }
   }
+
+  console.log(
+    `node-agent cleanup skipped: service=${serviceName} service_id=${serviceID} node=${nodeName || "-"} node_addr=${address} endpoints=${baseAddrs.join(",")} error=${lastError}`,
+  );
+  return false;
 }
 
 function shortID(raw: string): string {
@@ -785,13 +820,31 @@ async function cleanupOwnedCatalogServices(
       }
       if (!reason) continue;
 
+      const nodeAddress = (instance.Address ?? "").trim();
+      const owner = (instance.ServiceMeta?.[ownerIDMetaKey] ?? "").trim();
+      const source = (instance.ServiceMeta?.source ?? "").trim();
+      if (cfg.verboseCatalogCleanup) {
+        console.log(
+          `catalog cleanup candidate: service=${serviceName} service_id=${serviceID} node=${node} node_addr=${nodeAddress || "-"} owner_id=${owner || "-"} source=${source || "-"} reason=${reason}`,
+        );
+      }
+
       try {
         await deregisterCatalogService(cfg, node, serviceID);
         removedTotal += 1;
         if (reason === "not-desired") removedNotDesired += 1;
         else removedDuplicates += 1;
-        if (await deregisterNodeAgentService(cfg, instance.Address ?? "", serviceID)) {
+        if (cfg.verboseCatalogCleanup) {
+          console.log(
+            `catalog cleanup deregistered catalog instance: service=${serviceName} service_id=${serviceID} node=${node} reason=${reason}`,
+          );
+        }
+        if (await deregisterNodeAgentService(cfg, serviceName, node, nodeAddress, serviceID)) {
           removedNodeAgentServices += 1;
+        } else {
+          console.log(
+            `catalog cleanup warning: service=${serviceName} service_id=${serviceID} node=${node} node_addr=${nodeAddress || "-"} removed_from_catalog=true removed_from_node_agent=false duplicate_may_reappear=true`,
+          );
         }
       } catch (error) {
         console.log(`catalog cleanup deregister failed for ${node}/${serviceID}: ${(error as Error).message}`);
@@ -1084,6 +1137,9 @@ async function run(): Promise<void> {
     console.log(`docker mode configured: docker_socket=${cfg.dockerSocket}`);
   } else {
     console.log(`file mode configured: file_source_path=${cfg.fileSourcePath}`);
+  }
+  if (cfg.verboseCatalogCleanup) {
+    console.log("verbose catalog cleanup logging enabled");
   }
 
   console.log("waiting for consul leader availability");
