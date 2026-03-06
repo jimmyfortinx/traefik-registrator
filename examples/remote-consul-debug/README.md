@@ -13,6 +13,7 @@ docker compose logs -f registrator-file
 The stack runs:
 
 - `registrator-file`: this repository's image in `SOURCE_MODE=file`, pointed directly at `CONSUL_HTTP_ADDR`.
+- Optional `CONSUL_OVERLAY_HTTP_PORT` support for peer-node cleanup/pinning when overlay API traffic must use a different port than `CONSUL_HTTP_ADDR`.
 
 Note: if only Consul HTTP (`:18500`) is exposed and gossip (`:8301`) is not, an external Consul client cannot join the cluster. This setup intentionally avoids joining and uses HTTP API access only.
 
