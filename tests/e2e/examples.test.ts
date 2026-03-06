@@ -266,60 +266,6 @@ describe("compose examples", () => {
     });
   });
 
-  registerScenario("consul-lb-flap", async (project, composeFile) => {
-    function consulAgentServices(serviceName: string): Record<string, any> {
-      const body = compose(project, composeFile, [
-        "exec",
-        "-T",
-        serviceName,
-        "sh",
-        "-ec",
-        "wget -qO- http://127.0.0.1:8500/v1/agent/services",
-      ]);
-      return JSON.parse(body) as Record<string, any>;
-    }
-
-    function whoamiCountByBackend(): { a: number; b: number } {
-      const countFor = (serviceName: string): number =>
-        managedServices(consulAgentServices(serviceName)).filter(
-          (svc: any) => svc.Service === "whoami" && svc.Meta?.["owner-id"] === "example-consul-lb",
-        ).length;
-
-      return { a: countFor("consul-a"), b: countFor("consul-b") };
-    }
-
-    const expectSingleBackend = async (description: string, timeoutMs: number): Promise<void> => {
-      await waitUntil(description, timeoutMs, async () => {
-        const counts = whoamiCountByBackend();
-        const total = counts.a + counts.b;
-        const activeBackends = [counts.a, counts.b].filter((count) => count > 0).length;
-        return total === 1 && activeBackends === 1
-          ? true
-          : `expected one registration on one backend, got consul-a=${counts.a} consul-b=${counts.b}`;
-      });
-    };
-
-    const expectNoBackend = async (description: string, timeoutMs: number): Promise<void> => {
-      await waitUntil(description, timeoutMs, async () => {
-        const counts = whoamiCountByBackend();
-        const total = counts.a + counts.b;
-        return total === 0 ? true : `expected no registration, got consul-a=${counts.a} consul-b=${counts.b}`;
-      });
-    };
-
-    // Trigger a deterministic post-start docker event to avoid startup ordering flakes.
-    compose(project, composeFile, ["restart", "whoami"]);
-    await expectSingleBackend("initial registration sticks to one consul backend", 90_000);
-
-    for (let cycle = 1; cycle <= 3; cycle += 1) {
-      compose(project, composeFile, ["stop", "whoami"]);
-      await expectNoBackend(`whoami deregistered from both backends after stop cycle ${cycle}`, 45_000);
-
-      compose(project, composeFile, ["start", "whoami"]);
-      await expectSingleBackend(`whoami re-registers on one backend after start cycle ${cycle}`, 60_000);
-    }
-  });
-
   registerScenario("traefik-enable-filter", async (project, composeFile) => {
     await waitUntil("traefik.enable filter behavior", 90_000, async () => {
       const services = (await consulJson(project, composeFile, "/v1/agent/services")) as Record<string, any>;

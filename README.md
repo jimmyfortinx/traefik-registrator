@@ -16,10 +16,6 @@ In `file` mode, it reads service definitions from a file or directory and keeps 
   - removes stale instances for the same `owner-id` that are no longer desired;
   - removes duplicate instances that share the same `ServiceID`.
 - Runs delayed startup reconciliations at 3s, 10s, and 30s to catch eventual-consistency drift that appears after initial startup.
-- In `http` mode, if `CONSUL_HTTP_ADDR` points to a DNS host (not a direct IP/localhost), startup pins that address to one concrete Consul agent address from `/v1/agent/self` so agent writes stay sticky.
-- Peer-node Consul API calls (startup pinning and node-agent cleanup) can use `CONSUL_OVERLAY_HTTP_PORT` when overlay traffic needs a different port than `CONSUL_HTTP_ADDR` (for example local host-published `:18500` vs overlay `:8500`).
-- Node-agent cleanup retries deregistration on additional fallback ports when the first peer endpoint is unreachable.
-- If catalog cleanup cannot reach the source node agent for a stale instance, logs a warning that the instance may reappear due to Consul anti-entropy.
 - In `docker` mode:
   - Builds the full desired service set from currently running containers at startup.
   - Listens to Docker container events and reconciles on `start`/`stop`/`die`/`destroy`/`kill`/`pause`/`unpause`.
@@ -52,7 +48,6 @@ In `file` mode, it reads service definitions from a file or directory and keeps 
 ## Environment
 
 - `CONSUL_HTTP_ADDR` (default: `http://127.0.0.1:8500`)
-- `CONSUL_OVERLAY_HTTP_PORT` (optional: preferred peer-node port for overlay calls like pinning and node-agent cleanup)
 - `CONSUL_HTTP_TOKEN` (optional)
 - `SOURCE_MODE` (default: `docker`, values: `docker`, `file`)
 - `DOCKER_SOCKET` (default: `/var/run/docker.sock`, docker mode only)
@@ -160,8 +155,6 @@ Recommended:
 
 - For `deploy.mode: global` registrator, set a stable per-node `OWNER_ID` with a Swarm template.
 - Prefer `tasks.consul-server:8500` over `consul-server:8500` to avoid service VIP load-balancing surprises.
-- If `CONSUL_HTTP_ADDR` uses a node-local published host port (for example `:18500`), set `CONSUL_OVERLAY_HTTP_PORT=8500` so peer-node cleanup/pinning still uses overlay-reachable endpoints.
-- Keep `CONSUL_HTTP_ADDR` on plain HTTP when possible; startup auto-pinning only applies to `http://` endpoints.
 - Do not share the same `OWNER_ID` across multiple running registrator instances.
 - For a singleton file-mode registrator, set a fixed explicit `OWNER_ID` (for example `file-dokploy`).
 
@@ -234,7 +227,7 @@ docker compose up --build -d
 docker compose logs -f registrator-file
 ```
 
-The compose setup enables `LOG_VERBOSE_CATALOG_CLEANUP=true` by default so you can see which node/service duplicate cleanup targets and when node-agent cleanup is unreachable.
+The compose setup enables `LOG_VERBOSE_CATALOG_CLEANUP=true` by default so you can see which node/service duplicate cleanup targets.
 
 ## Local End-to-End Test
 
@@ -333,7 +326,6 @@ All scenario files are in `examples/` and intentionally publish no ports, so mul
 - `examples/hybrid-docker-file`: verifies docker + file mode can run together and file update/delete/create events reconcile services.
 - `examples/recover-owned-stale-services`: verifies startup owner cleanup removes stale services for matching `OWNER_ID` only.
 - `examples/delayed-catalog-duplicate`: injects a duplicate catalog instance after startup and verifies delayed startup reconciliation prunes it.
-- `examples/consul-lb-flap`: verifies startup pinning keeps agent registrations on a single Consul backend when `CONSUL_HTTP_ADDR` is load-balanced.
 - `examples/remote-consul-debug`: reusable non-swarm compose setup for debugging against external Consul servers with verbose cleanup traces.
 
 ## GitHub Actions

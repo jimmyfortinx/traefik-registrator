@@ -7,7 +7,6 @@ services:
       SOURCE_MODE: file
       FILE_SOURCE_PATH: /etc/traefik-registrator/services.d
       CONSUL_HTTP_ADDR: "${CONSUL_HTTP_ADDR:-http://10.1.2.10:18500}"
-      CONSUL_OVERLAY_HTTP_PORT: "${CONSUL_OVERLAY_HTTP_PORT:-8500}"
       OWNER_ID: "${OWNER_ID:-file-debug-local}"
       SERVICE_ID_PREFIX: "${SERVICE_ID_PREFIX:-file-debug-}"
       LOG_VERBOSE_CATALOG_CLEANUP: "${LOG_VERBOSE_CATALOG_CLEANUP:-true}"
