@@ -1,7 +1,6 @@
 import { watch } from "node:fs";
 import { promises as fs } from "node:fs";
 import http from "node:http";
-import { isIP } from "node:net";
 import path from "node:path";
 import process from "node:process";
 import { parse as parseYaml } from "yaml";
@@ -10,7 +9,6 @@ type SourceMode = "docker" | "file";
 
 type Config = {
   consulHTTPAddr: string;
-  consulOverlayHTTPPort: string;
   consulToken: string;
   sourceMode: SourceMode;
   dockerSocket: string;
@@ -92,17 +90,10 @@ function parseBool(raw: string): boolean {
   return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
 }
 
-function isValidPort(raw: string): boolean {
-  if (!/^\d+$/.test(raw.trim())) return false;
-  const parsed = Number(raw);
-  return Number.isInteger(parsed) && parsed > 0 && parsed <= 65535;
-}
-
 function loadConfig(): Config {
   const ownerFromHost = process.env.HOSTNAME?.trim() ?? "";
   return {
     consulHTTPAddr: env("CONSUL_HTTP_ADDR", "http://127.0.0.1:8500"),
-    consulOverlayHTTPPort: env("CONSUL_OVERLAY_HTTP_PORT", ""),
     consulToken: env("CONSUL_HTTP_TOKEN", ""),
     sourceMode: env("SOURCE_MODE", "docker") === "file" ? sourceModeFile : sourceModeDocker,
     dockerSocket: env("DOCKER_SOCKET", "/var/run/docker.sock"),
@@ -122,10 +113,6 @@ function loadConfig(): Config {
 async function validateConfig(cfg: Config): Promise<void> {
   if (!cfg.ownerID.trim()) {
     throw new Error("OWNER_ID resolved to empty value");
-  }
-
-  if (cfg.consulOverlayHTTPPort && !isValidPort(cfg.consulOverlayHTTPPort)) {
-    throw new Error("CONSUL_OVERLAY_HTTP_PORT must be a valid TCP port");
   }
 
   if (cfg.sourceMode === sourceModeDocker) {
@@ -353,86 +340,9 @@ async function consulRequestAt(
   return response;
 }
 
-function trimTrailingSlash(raw: string): string {
-  return raw.replace(/\/$/, "");
-}
-
-function defaultPortForProtocol(protocol: string): string {
-  return protocol === "https:" ? "443" : "80";
-}
-
-function defaultConsulAgentPortForProtocol(protocol: string): string {
-  return protocol === "https:" ? "8501" : "8500";
-}
-
-function isDirectConsulHost(rawHost: string): boolean {
-  const host = rawHost.trim().toLowerCase();
-  if (!host) return false;
-  if (host === "localhost" || host === "127.0.0.1" || host === "::1") return true;
-  return isIP(host) !== 0;
-}
-
-function formatHostForURL(raw: string): string {
-  if (raw.includes(":") && !raw.startsWith("[") && !raw.endsWith("]")) {
-    return `[${raw}]`;
-  }
-  return raw;
-}
-
-function consulPeerBaseAddrsFromConfig(cfg: Config, nodeAddress: string): string[] {
-  const parsed = new URL(cfg.consulHTTPAddr);
-  const host = formatHostForURL(nodeAddress);
-  const configuredPort = parsed.port || defaultPortForProtocol(parsed.protocol);
-  const overlayPort = cfg.consulOverlayHTTPPort.trim();
-  const nativeAgentPort = defaultConsulAgentPortForProtocol(parsed.protocol);
-  const ports = [overlayPort, configuredPort, nativeAgentPort].filter((entry) => entry !== "");
-
-  const uniquePorts: string[] = [];
-  for (const port of ports) {
-    if (!uniquePorts.includes(port)) {
-      uniquePorts.push(port);
-    }
-  }
-
-  return uniquePorts.map((port) => `${parsed.protocol}//${host}:${port}`);
-}
-
 async function consulAgentSelf(cfg: Config): Promise<ConsulAgentSelfResponse> {
   const response = await consulRequest(cfg, "GET", "/v1/agent/self");
   return (await response.json()) as ConsulAgentSelfResponse;
-}
-
-async function pinConsulAddrToSingleAgent(cfg: Config): Promise<void> {
-  let parsed: URL;
-  try {
-    parsed = new URL(cfg.consulHTTPAddr);
-  } catch {
-    return;
-  }
-
-  if (parsed.protocol !== "http:") return;
-  if (isDirectConsulHost(parsed.hostname)) return;
-  if (parsed.pathname !== "" && parsed.pathname !== "/") return;
-
-  const self = await consulAgentSelf(cfg);
-  const memberAddr = (self.Member?.Addr ?? "").trim();
-  if (!memberAddr) return;
-
-  const current = trimTrailingSlash(cfg.consulHTTPAddr);
-  const candidates = consulPeerBaseAddrsFromConfig(cfg, memberAddr).filter((baseAddr) => baseAddr !== current);
-
-  if (candidates.length === 0) return;
-
-  for (const candidate of candidates) {
-    try {
-      await consulRequestAt(candidate, cfg.consulToken, "GET", "/v1/status/leader", undefined, 2500);
-      cfg.consulHTTPAddr = candidate;
-      console.log(`consul endpoint pinned: ${cfg.consulHTTPAddr}`);
-      return;
-    } catch (error) {
-      console.log(`consul endpoint pin skipped for ${candidate}: ${(error as Error).message}`);
-    }
-  }
 }
 
 async function consulLeader(cfg: Config): Promise<string> {
@@ -494,50 +404,6 @@ async function deregisterCatalogService(cfg: Config, node: string, serviceID: st
     Node: node,
     ServiceID: serviceID,
   });
-}
-
-function isRequestTimeoutError(raw: string): boolean {
-  const message = raw.trim().toLowerCase();
-  return message.includes("timed out");
-}
-
-async function deregisterNodeAgentService(
-  cfg: Config,
-  serviceName: string,
-  nodeName: string,
-  nodeAddress: string,
-  serviceID: string,
-): Promise<boolean> {
-  const address = nodeAddress.trim();
-  if (!address) return false;
-
-  const baseAddrs = consulPeerBaseAddrsFromConfig(cfg, address);
-  const reqPath = `/v1/agent/service/deregister/${encodeURIComponent(serviceID)}`;
-  let lastError = "";
-
-  for (const [index, baseAddr] of baseAddrs.entries()) {
-    try {
-      await consulRequestAt(baseAddr, cfg.consulToken, "PUT", reqPath, undefined, 2500);
-      if (index > 0) {
-        console.log(
-          `node-agent cleanup fallback succeeded: service=${serviceName} service_id=${serviceID} node=${nodeName || "-"} node_addr=${address} endpoint=${baseAddr}`,
-        );
-      }
-      return true;
-    } catch (error) {
-      lastError = (error as Error).message;
-      if (isRequestTimeoutError(lastError)) {
-        console.log(
-          `node-agent unregister timeout: service=${serviceName} service_id=${serviceID} node=${nodeName || "-"} node_addr=${address} endpoint=${baseAddr} attempt=${index + 1}/${baseAddrs.length} error=${lastError}`,
-        );
-      }
-    }
-  }
-
-  console.log(
-    `node-agent cleanup skipped: service=${serviceName} service_id=${serviceID} node=${nodeName || "-"} node_addr=${address} endpoints=${baseAddrs.join(",")} error=${lastError}`,
-  );
-  return false;
 }
 
 function shortID(raw: string): string {
@@ -786,7 +652,6 @@ type OwnedCatalogCleanupResult = {
   removedTotal: number;
   removedNotDesired: number;
   removedDuplicates: number;
-  removedNodeAgentServices: number;
 };
 
 function prioritizeLocalNode(
@@ -809,7 +674,6 @@ async function cleanupOwnedCatalogServices(
   let removedTotal = 0;
   let removedNotDesired = 0;
   let removedDuplicates = 0;
-  let removedNodeAgentServices = 0;
   const keptDesired = new Set<string>();
   const catalogServices = await listCatalogServices(cfg);
 
@@ -838,12 +702,11 @@ async function cleanupOwnedCatalogServices(
       }
       if (!reason) continue;
 
-      const nodeAddress = (instance.Address ?? "").trim();
       const owner = (instance.ServiceMeta?.[ownerIDMetaKey] ?? "").trim();
       const source = (instance.ServiceMeta?.source ?? "").trim();
       if (cfg.verboseCatalogCleanup) {
         console.log(
-          `catalog cleanup candidate: service=${serviceName} service_id=${serviceID} node=${node} node_addr=${nodeAddress || "-"} owner_id=${owner || "-"} source=${source || "-"} reason=${reason}`,
+          `catalog cleanup candidate: service=${serviceName} service_id=${serviceID} node=${node} owner_id=${owner || "-"} source=${source || "-"} reason=${reason}`,
         );
       }
 
@@ -857,26 +720,18 @@ async function cleanupOwnedCatalogServices(
             `catalog cleanup deregistered catalog instance: service=${serviceName} service_id=${serviceID} node=${node} reason=${reason}`,
           );
         }
-        if (await deregisterNodeAgentService(cfg, serviceName, node, nodeAddress, serviceID)) {
-          removedNodeAgentServices += 1;
-        } else {
-          console.log(
-            `catalog cleanup warning: service=${serviceName} service_id=${serviceID} node=${node} node_addr=${nodeAddress || "-"} removed_from_catalog=true removed_from_node_agent=false duplicate_may_reappear=true`,
-          );
-        }
       } catch (error) {
         console.log(`catalog cleanup deregister failed for ${node}/${serviceID}: ${(error as Error).message}`);
       }
     }
   }
 
-  return { removedTotal, removedNotDesired, removedDuplicates, removedNodeAgentServices };
+  return { removedTotal, removedNotDesired, removedDuplicates };
 }
 
 async function cleanupOwnedServicesOnStartup(cfg: Config): Promise<void> {
   let removedAgent = 0;
   let removedCatalog = 0;
-  let removedNodeAgentServices = 0;
 
   try {
     const services = await listAgentServices(cfg);
@@ -896,14 +751,11 @@ async function cleanupOwnedServicesOnStartup(cfg: Config): Promise<void> {
   try {
     const result = await cleanupOwnedCatalogServices(cfg);
     removedCatalog = result.removedTotal;
-    removedNodeAgentServices = result.removedNodeAgentServices;
   } catch (error) {
     console.log(`startup cleanup catalog scan skipped: ${(error as Error).message}`);
   }
 
-  console.log(
-    `startup cleanup complete: owner_id=${cfg.ownerID} removed_agent=${removedAgent} removed_catalog=${removedCatalog} removed_node_agent=${removedNodeAgentServices}`,
-  );
+  console.log(`startup cleanup complete: owner_id=${cfg.ownerID} removed_agent=${removedAgent} removed_catalog=${removedCatalog}`);
 }
 
 async function pruneUnexpectedOwnedAgentServices(
@@ -981,18 +833,16 @@ async function applyDesiredState(
 
   let removedCatalogNotDesired = 0;
   let removedCatalogDuplicates = 0;
-  let removedCatalogNodeAgentServices = 0;
   try {
     const catalogCleanup = await cleanupOwnedCatalogServices(cfg, new Set(desired.keys()));
     removedCatalogNotDesired = catalogCleanup.removedNotDesired;
     removedCatalogDuplicates = catalogCleanup.removedDuplicates;
-    removedCatalogNodeAgentServices = catalogCleanup.removedNodeAgentServices;
   } catch (error) {
     console.log(`catalog cleanup skipped: ${(error as Error).message}`);
   }
 
   console.log(
-    `sync complete: ${sourceSummary} desired=${desired.size} upserted=${upserted} removed_not_desired=${removedNoLongerDesired} removed_unexpected_owned=${removedUnexpected} removed_catalog_not_desired=${removedCatalogNotDesired} removed_catalog_duplicates=${removedCatalogDuplicates} removed_node_agent=${removedCatalogNodeAgentServices}`,
+    `sync complete: ${sourceSummary} desired=${desired.size} upserted=${upserted} removed_not_desired=${removedNoLongerDesired} removed_unexpected_owned=${removedUnexpected} removed_catalog_not_desired=${removedCatalogNotDesired} removed_catalog_duplicates=${removedCatalogDuplicates}`,
   );
 }
 
@@ -1163,12 +1013,6 @@ async function run(): Promise<void> {
   console.log("waiting for consul leader availability");
   await waitForConsulReady(cfg, 90_000);
   console.log("consul is ready");
-
-  try {
-    await pinConsulAddrToSingleAgent(cfg);
-  } catch (error) {
-    console.log(`consul endpoint pin skipped: ${(error as Error).message}`);
-  }
 
   try {
     const detectedNodeName = await consulLocalNodeName(cfg);
