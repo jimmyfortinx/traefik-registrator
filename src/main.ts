@@ -10,6 +10,7 @@ type SourceMode = "docker" | "file";
 
 type Config = {
   consulHTTPAddr: string;
+  consulOverlayHTTPPort: string;
   consulToken: string;
   sourceMode: SourceMode;
   dockerSocket: string;
@@ -91,10 +92,17 @@ function parseBool(raw: string): boolean {
   return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
 }
 
+function isValidPort(raw: string): boolean {
+  if (!/^\d+$/.test(raw.trim())) return false;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed > 0 && parsed <= 65535;
+}
+
 function loadConfig(): Config {
   const ownerFromHost = process.env.HOSTNAME?.trim() ?? "";
   return {
     consulHTTPAddr: env("CONSUL_HTTP_ADDR", "http://127.0.0.1:8500"),
+    consulOverlayHTTPPort: env("CONSUL_OVERLAY_HTTP_PORT", ""),
     consulToken: env("CONSUL_HTTP_TOKEN", ""),
     sourceMode: env("SOURCE_MODE", "docker") === "file" ? sourceModeFile : sourceModeDocker,
     dockerSocket: env("DOCKER_SOCKET", "/var/run/docker.sock"),
@@ -114,6 +122,10 @@ function loadConfig(): Config {
 async function validateConfig(cfg: Config): Promise<void> {
   if (!cfg.ownerID.trim()) {
     throw new Error("OWNER_ID resolved to empty value");
+  }
+
+  if (cfg.consulOverlayHTTPPort && !isValidPort(cfg.consulOverlayHTTPPort)) {
+    throw new Error("CONSUL_OVERLAY_HTTP_PORT must be a valid TCP port");
   }
 
   if (cfg.sourceMode === sourceModeDocker) {
@@ -367,16 +379,22 @@ function formatHostForURL(raw: string): string {
   return raw;
 }
 
-function nodeAgentBaseAddrsFromConfig(cfg: Config, nodeAddress: string): string[] {
+function consulPeerBaseAddrsFromConfig(cfg: Config, nodeAddress: string): string[] {
   const parsed = new URL(cfg.consulHTTPAddr);
   const host = formatHostForURL(nodeAddress);
   const configuredPort = parsed.port || defaultPortForProtocol(parsed.protocol);
+  const overlayPort = cfg.consulOverlayHTTPPort.trim();
   const nativeAgentPort = defaultConsulAgentPortForProtocol(parsed.protocol);
-  const out = [`${parsed.protocol}//${host}:${configuredPort}`];
-  if (configuredPort !== nativeAgentPort) {
-    out.push(`${parsed.protocol}//${host}:${nativeAgentPort}`);
+  const ports = [overlayPort, configuredPort, nativeAgentPort].filter((entry) => entry !== "");
+
+  const uniquePorts: string[] = [];
+  for (const port of ports) {
+    if (!uniquePorts.includes(port)) {
+      uniquePorts.push(port);
+    }
   }
-  return out;
+
+  return uniquePorts.map((port) => `${parsed.protocol}//${host}:${port}`);
 }
 
 async function consulAgentSelf(cfg: Config): Promise<ConsulAgentSelfResponse> {
@@ -400,21 +418,21 @@ async function pinConsulAddrToSingleAgent(cfg: Config): Promise<void> {
   const memberAddr = (self.Member?.Addr ?? "").trim();
   if (!memberAddr) return;
 
-  const port = parsed.port || defaultPortForProtocol(parsed.protocol);
-  const candidate = `${parsed.protocol}//${formatHostForURL(memberAddr)}:${port}`;
   const current = trimTrailingSlash(cfg.consulHTTPAddr);
+  const candidates = consulPeerBaseAddrsFromConfig(cfg, memberAddr).filter((baseAddr) => baseAddr !== current);
 
-  if (candidate === current) return;
+  if (candidates.length === 0) return;
 
-  try {
-    await consulRequestAt(candidate, cfg.consulToken, "GET", "/v1/status/leader", undefined, 2500);
-  } catch (error) {
-    console.log(`consul endpoint pin skipped for ${candidate}: ${(error as Error).message}`);
-    return;
+  for (const candidate of candidates) {
+    try {
+      await consulRequestAt(candidate, cfg.consulToken, "GET", "/v1/status/leader", undefined, 2500);
+      cfg.consulHTTPAddr = candidate;
+      console.log(`consul endpoint pinned: ${cfg.consulHTTPAddr}`);
+      return;
+    } catch (error) {
+      console.log(`consul endpoint pin skipped for ${candidate}: ${(error as Error).message}`);
+    }
   }
-
-  cfg.consulHTTPAddr = candidate;
-  console.log(`consul endpoint pinned: ${cfg.consulHTTPAddr}`);
 }
 
 async function consulLeader(cfg: Config): Promise<string> {
@@ -493,7 +511,7 @@ async function deregisterNodeAgentService(
   const address = nodeAddress.trim();
   if (!address) return false;
 
-  const baseAddrs = nodeAgentBaseAddrsFromConfig(cfg, address);
+  const baseAddrs = consulPeerBaseAddrsFromConfig(cfg, address);
   const reqPath = `/v1/agent/service/deregister/${encodeURIComponent(serviceID)}`;
   let lastError = "";
 
